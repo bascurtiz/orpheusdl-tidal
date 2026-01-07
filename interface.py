@@ -83,7 +83,7 @@ class ModuleInterface:
         if not saved_sessions:
             saved_sessions = {}
 
-        if not self.settings['enable_mobile']:
+        if not self.settings.get('enable_mobile', True):
             self.available_sessions = [SessionType.TV.name]
 
         while True:
@@ -171,11 +171,14 @@ class ModuleInterface:
         session = None
         # initialize session with the needed API keys
         if session_type == SessionType.TV.name:
-            session = TidalTvSession(self.settings['tv_atmos_token'], self.settings['tv_atmos_secret'])
+            session = TidalTvSession(
+                self.settings.get('tv_atmos_token', '4N3n6Q1x95LL5K7p'),
+                self.settings.get('tv_atmos_secret', 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=')
+            )
         elif session_type == SessionType.MOBILE_ATMOS.name:
-            session = TidalMobileSession(self.settings['mobile_atmos_hires_token'])
+            session = TidalMobileSession(self.settings.get('mobile_atmos_hires_token', 'km8T1xS355y7dd3H'))
         else:
-            session = TidalMobileSession(self.settings['mobile_hires_token'])
+            session = TidalMobileSession(self.settings.get('mobile_hires_token', '6BDSRdpK9hqEBTgU'))
         return session
 
     def auth_session(self, session, session_type, login_session):
@@ -473,7 +476,7 @@ class ModuleInterface:
             if 'SONY_360RA' in media_tags:
                 format = '360ra'
             elif 'DOLBY_ATMOS' in media_tags:
-                if self.settings['prefer_ac4']:
+                if self.settings.get('prefer_ac4', False):
                     format = 'ac4'
                 else:
                     format = 'ac3'
@@ -540,7 +543,7 @@ class ModuleInterface:
                 download_args = {'audio_track': audio_track}
             else:
                 # check if MQA
-                if track_codec is CodecEnum.MQA and self.settings['fix_mqa']:
+                if track_codec is CodecEnum.MQA and self.settings.get('fix_mqa', True):
                     # download the first chunk of the flac file to analyze it
                     temp_file_path = self.download_temp_header(manifest['urls'][0])
 
