@@ -746,7 +746,7 @@ class ModuleInterface:
         # convert .mp4 back to .flac
         try:
             _get_ffmpeg().input(merged_temp_location, hide_banner=None, y=None).output(output_location, acodec='copy',
-                                                                                loglevel='error').run()
+                                                                                loglevel='error', map_metadata='-1').run()
             # Remove all files
             silentremove(merged_temp_location)
             for temp_location in temp_locations:
