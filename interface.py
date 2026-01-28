@@ -235,10 +235,36 @@ class ModuleInterface:
         items = []
         for i in results.get('items'):
             duration, name = None, None
+            image_url = None
+            preview_url = None
+            
             if query_type is DownloadTypeEnum.artist:
                 name = i.get('name')
                 artists = None
                 year = None
+                # Artist image (if available) - check multiple possible field names
+                # Tidal API may use 'picture', 'image', 'squareImage', or 'cover' for artist images
+                # Also check nested structures that might contain image data
+                # Default fallback image UUID (same as python-tidal library uses)
+                DEFAULT_ARTIST_IMG = "1e01cdb6-f15d-4d8b-8440-a047976c1cac"
+                artist_image_id = (
+                    i.get('picture') or 
+                    i.get('image') or 
+                    i.get('squareImage') or 
+                    i.get('cover') or
+                    i.get('pictureId') or
+                    i.get('imageId') or
+                    (i.get('images', {}).get('picture') if isinstance(i.get('images'), dict) else None) or
+                    (i.get('images', {}).get('cover') if isinstance(i.get('images'), dict) else None) or
+                    (i.get('images', {}).get('squareImage') if isinstance(i.get('images'), dict) else None) or
+                    DEFAULT_ARTIST_IMG  # Fallback to default image if none found
+                )
+                if artist_image_id:
+                    # Use 750x750.jpg for artists as it's more reliably available
+                    image_url = f'https://resources.tidal.com/images/{artist_image_id.replace("-", "/")}/750x750.jpg'
+                # Note: If artist image is not in search results, lazy-loading in GUI will fetch it
+                # Note: If artist image is not in search results, it may need to be fetched
+                # separately via get_artist() API call. The lazy-loading in GUI will handle this.
             elif query_type is DownloadTypeEnum.playlist:
                 if 'name' in i.get('creator'):
                     artists = [i.get('creator').get('name')]
@@ -250,15 +276,38 @@ class ModuleInterface:
                 duration = i.get('duration')
                 # TODO: Use playlist creation date or lastUpdated?
                 year = i.get('created')[:4]
+                # Playlist cover image - check multiple possible field names
+                square_image_id = (
+                    i.get('squareImage') or
+                    i.get('image') or
+                    i.get('cover') or
+                    i.get('picture')
+                )
+                if square_image_id:
+                    image_url = self._generate_artwork_url(square_image_id, size=56, max_size=1080)
+                # Debug: Log available fields if squareImage is missing
+                # Uncomment to debug playlist cover extraction:
+                # if not square_image_id:
+                #     print(f"[Tidal Debug] Playlist '{i.get('title', 'Unknown')}': No squareImage found. Available keys: {list(i.keys())}")
             elif query_type is DownloadTypeEnum.track:
                 artists = [j.get('name') for j in i.get('artists')]
                 # Getting the year from the album?
-                year = i.get('album').get('releaseDate')[:4] if i.get('album').get('releaseDate') else None
+                album_data = i.get('album') or {}
+                year = album_data.get('releaseDate')[:4] if album_data.get('releaseDate') else None
                 duration = i.get('duration')
+                # Track cover image (from album) - use 56px for search thumbnails
+                if album_data.get('cover'):
+                    image_url = self._generate_artwork_url(album_data.get('cover'), size=56)
+                # Preview URL - Tidal may not provide preview URLs in search results
+                # Leave as None, GUI can handle lazy-loading if needed
+                preview_url = None
             elif query_type is DownloadTypeEnum.album:
                 artists = [j.get('name') for j in i.get('artists')]
                 duration = i.get('duration')
                 year = i.get('releaseDate')[:4]
+                # Album cover image - use 56px for search thumbnails
+                if i.get('cover'):
+                    image_url = self._generate_artwork_url(i.get('cover'), size=56)
             else:
                 raise Exception('Query type is invalid')
 
@@ -284,7 +333,10 @@ class ModuleInterface:
                 result_id=str(i.get('id')) if query_type is not DownloadTypeEnum.playlist else i.get('uuid'),
                 explicit=i.get('explicit'),
                 duration=duration,
-                additional=[additional] if additional else None
+                additional=[additional] if additional else None,
+                image_url=image_url,
+                preview_url=preview_url,
+                extra_kwargs={'raw_result': i}  # Store raw API response for full-size cover URL generation
             )
 
             items.append(item)
@@ -840,6 +892,59 @@ class ModuleInterface:
             # convert the dictionary back to a list of CreditsInfo
             return [CreditsInfo(sanitise_name(k), v) for k, v in credits_dict.items()]
         return None
+
+    def get_preview_stream_url(self, track_id: str) -> Optional[str]:
+        """
+        Get a preview stream URL for a track using LOW quality (96kbit/s AAC).
+        This can be used for preview playback in the GUI.
+        
+        Returns the preview URL if available, None otherwise.
+        """
+        try:
+            # Use LOW quality (96kbit/s AAC) for previews
+            stream_data = self.session.get_stream_url(track_id, 'LOW')
+            
+            if stream_data is None:
+                return None
+            
+            # Extract the actual stream URL from the manifest
+            if stream_data.get('manifestMimeType') == 'application/dash+xml':
+                # For DASH manifests, parse the MPD to get a playable segment URL
+                # We'll try to get the first media segment (not just the init segment)
+                try:
+                    manifest = base64.b64decode(stream_data['manifest'])
+                    audio_tracks = self.parse_mpd(manifest)
+                    if audio_tracks and len(audio_tracks) > 0:
+                        urls = audio_tracks[0].urls
+                        if urls and len(urls) > 1:
+                            # Return the first media segment (index 1, since 0 is usually init)
+                            # This should be playable for preview purposes
+                            return urls[1]
+                        elif urls and len(urls) > 0:
+                            # Fallback to init segment if no media segments found
+                            return urls[0]
+                except Exception as e:
+                    logging.debug(f'{module_information.service_name}: Error parsing DASH manifest for preview: {e}')
+                    return None
+            else:
+                # For non-DASH manifests (JSON), extract the URL from the manifest
+                try:
+                    manifest = json.loads(base64.b64decode(stream_data['manifest']))
+                    urls = manifest.get('urls', [])
+                    if urls and len(urls) > 0:
+                        return urls[0]
+                except Exception as e:
+                    logging.debug(f'{module_information.service_name}: Error parsing JSON manifest for preview: {e}')
+                    return None
+            
+            return None
+        except (TidalError, TidalRequestError) as e:
+            # Track might not be available for preview (region locked, etc.)
+            logging.debug(f'{module_information.service_name}: Could not get preview URL for track {track_id}: {e}')
+            return None
+        except Exception as e:
+            logging.debug(f'{module_information.service_name}: Error getting preview URL for track {track_id}: {e}')
+            return None
 
     @staticmethod
     def convert_tags(track_data: dict, album_data: dict, mqa_file: MqaIdentifier = None) -> Tags:
