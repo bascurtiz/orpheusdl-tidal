@@ -22,6 +22,8 @@ from xml.etree import ElementTree
 from tqdm import tqdm
 
 from utils.models import *
+import os
+import tempfile
 from utils.utils import sanitise_name, silentremove, download_to_temp, create_temp_filename, create_requests_session
 from .mqa_identifier_python.mqa_identifier_python.mqa_identifier import MqaIdentifier
 from .tidal_api import TidalTvSession, TidalApi, TidalMobileSession, SessionType, TidalError, TidalRequestError
@@ -408,11 +410,16 @@ class ModuleInterface:
 
         # use set to filter out duplicate album ids
         albums = {str(album.get('id')) for album in artist_albums + artist_singles + credit_albums}
+        # Include credit_albums in album_extra_kwargs so GUI has full album data (title, artist, cover) for all albums
+        all_album_dicts = {str(a.get('id')): a for a in artist_albums + artist_singles}
+        for alb in credit_albums:
+            if alb and alb.get('id') is not None:
+                all_album_dicts[str(alb.get('id'))] = alb
 
         return ArtistInfo(
             name=artist_data.get('name'),
             albums=list(albums),
-            album_extra_kwargs={'data': {str(album.get('id')): album for album in artist_albums + artist_singles}}
+            album_extra_kwargs={'data': all_album_dicts}
         )
 
     def get_album_info(self, album_id: str, data=None) -> AlbumInfo:
@@ -654,6 +661,7 @@ class ModuleInterface:
             name=track_name,
             album=album_data.get('title'),
             album_id=album_id,
+            id=str(track_id),
             artists=[a.get('name') for a in track_data.get('artists')],
             artist_id=track_data['artist'].get('id'),
             release_year=track_data.get('streamStartDate')[:4] if track_data.get(
@@ -895,55 +903,68 @@ class ModuleInterface:
 
     def get_preview_stream_url(self, track_id: str) -> Optional[str]:
         """
-        Get a preview stream URL for a track using LOW quality (96kbit/s AAC).
-        This can be used for preview playback in the GUI.
-        
-        Returns the preview URL if available, None otherwise.
+        Get a playable preview for a track using LOW quality (96kbit/s AAC).
+        Downloads init + first media segments to a temp file so the GUI can play it.
+        Returns the path to the temp .m4a file, or None if unavailable.
         """
         try:
-            # Use LOW quality (96kbit/s AAC) for previews
             stream_data = self.session.get_stream_url(track_id, 'LOW')
-            
             if stream_data is None:
                 return None
-            
-            # Extract the actual stream URL from the manifest
+
+            preview_path = None
             if stream_data.get('manifestMimeType') == 'application/dash+xml':
-                # For DASH manifests, parse the MPD to get a playable segment URL
-                # We'll try to get the first media segment (not just the init segment)
                 try:
                     manifest = base64.b64decode(stream_data['manifest'])
                     audio_tracks = self.parse_mpd(manifest)
-                    if audio_tracks and len(audio_tracks) > 0:
-                        urls = audio_tracks[0].urls
-                        if urls and len(urls) > 1:
-                            # Return the first media segment (index 1, since 0 is usually init)
-                            # This should be playable for preview purposes
-                            return urls[1]
-                        elif urls and len(urls) > 0:
-                            # Fallback to init segment if no media segments found
-                            return urls[0]
+                    if not audio_tracks:
+                        return None
+                    urls = audio_tracks[0].urls
+                    if not urls:
+                        return None
+                    # Download init + up to 10 media segments (~30s) and concatenate into one .m4a
+                    num_media = min(10, max(0, len(urls) - 1))
+                    if num_media == 0:
+                        return None
+                    segment_paths = []
+                    try:
+                        for i in range(1 + num_media):
+                            seg_path = download_to_temp(urls[i], extension='mp4')
+                            segment_paths.append(seg_path)
+                        preview_path = os.path.join(tempfile.gettempdir(), f'orpheus_tidal_preview_{track_id}.m4a')
+                        with open(preview_path, 'wb') as out:
+                            for p in segment_paths:
+                                with open(p, 'rb') as f:
+                                    out.write(f.read())
+                    finally:
+                        for p in segment_paths:
+                            silentremove(p)
+                    if preview_path and os.path.exists(preview_path) and os.path.getsize(preview_path) > 0:
+                        return preview_path
+                    silentremove(preview_path)
+                    return None
                 except Exception as e:
-                    logging.debug(f'{module_information.service_name}: Error parsing DASH manifest for preview: {e}')
+                    logging.debug(f'{module_information.service_name}: Error building DASH preview: {e}')
                     return None
             else:
-                # For non-DASH manifests (JSON), extract the URL from the manifest
                 try:
                     manifest = json.loads(base64.b64decode(stream_data['manifest']))
                     urls = manifest.get('urls', [])
-                    if urls and len(urls) > 0:
-                        return urls[0]
-                except Exception as e:
-                    logging.debug(f'{module_information.service_name}: Error parsing JSON manifest for preview: {e}')
+                    if not urls:
+                        return None
+                    preview_path = download_to_temp(urls[0], extension='m4a')
+                    if preview_path and os.path.exists(preview_path) and os.path.getsize(preview_path) > 0:
+                        return preview_path
+                    silentremove(preview_path)
                     return None
-            
-            return None
+                except Exception as e:
+                    logging.debug(f'{module_information.service_name}: Error building JSON preview: {e}')
+                    return None
         except (TidalError, TidalRequestError) as e:
-            # Track might not be available for preview (region locked, etc.)
-            logging.debug(f'{module_information.service_name}: Could not get preview URL for track {track_id}: {e}')
+            logging.debug(f'{module_information.service_name}: Could not get preview for track {track_id}: {e}')
             return None
         except Exception as e:
-            logging.debug(f'{module_information.service_name}: Error getting preview URL for track {track_id}: {e}')
+            logging.debug(f'{module_information.service_name}: Error getting preview for track {track_id}: {e}')
             return None
 
     @staticmethod
