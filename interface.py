@@ -239,7 +239,8 @@ class ModuleInterface:
             duration, name = None, None
             image_url = None
             preview_url = None
-            
+            playlist_track_count = None
+
             if query_type is DownloadTypeEnum.artist:
                 name = i.get('name')
                 artists = None
@@ -278,6 +279,7 @@ class ModuleInterface:
                 duration = i.get('duration')
                 # TODO: Use playlist creation date or lastUpdated?
                 year = i.get('created')[:4]
+                playlist_track_count = i.get('numberOfTracks') or i.get('number_of_tracks')
                 # Playlist cover image - check multiple possible field names
                 square_image_id = (
                     i.get('squareImage') or
@@ -327,6 +329,12 @@ class ModuleInterface:
                     additional = "MQA"
                 else:
                     additional = 'HiFi'
+            elif query_type is DownloadTypeEnum.playlist and playlist_track_count is not None:
+                additional = [f"1 track" if playlist_track_count == 1 else f"{playlist_track_count} tracks"]
+
+            # Hide playlists with no tracks (e.g. video-only playlists)
+            if query_type is DownloadTypeEnum.playlist and (playlist_track_count is None or playlist_track_count == 0):
+                continue
 
             item = SearchResult(
                 name=name,
@@ -335,7 +343,7 @@ class ModuleInterface:
                 result_id=str(i.get('id')) if query_type is not DownloadTypeEnum.playlist else i.get('uuid'),
                 explicit=i.get('explicit'),
                 duration=duration,
-                additional=[additional] if additional else None,
+                additional=(additional if isinstance(additional, list) else [additional]) if additional else None,
                 image_url=image_url,
                 preview_url=preview_url,
                 extra_kwargs={'raw_result': i}  # Store raw API response for full-size cover URL generation
