@@ -14,6 +14,46 @@ def _get_ffmpeg():
         _ffmpeg_module = ffmpeg
     return _ffmpeg_module
 
+def _get_ffmpeg_cmd():
+    """Return path to ffmpeg executable: cwd and script dir first (so root ffmpeg.exe is used), then PATH."""
+    import sys
+    ffmpeg_name = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
+    # 1) Current working directory (user ran e.g. "python orpheus.py" from project root)
+    cwd_candidate = os.path.join(os.getcwd(), ffmpeg_name)
+    if os.path.isfile(cwd_candidate):
+        res = os.path.abspath(cwd_candidate)
+        logging.debug(f'TIDAL: Using ffmpeg from cwd: {res}')
+        return res
+    # 2) Directory of the main script (orpheus.py or gui.py)
+    try:
+        main = sys.modules.get('__main__')
+        if main and getattr(main, '__file__', None):
+            root = os.path.dirname(os.path.abspath(main.__file__))
+            candidate = os.path.join(root, ffmpeg_name)
+            if os.path.isfile(candidate):
+                res = os.path.abspath(candidate)
+                logging.debug(f'TIDAL: Using ffmpeg from script dir: {res}')
+                return res
+    except Exception:
+        pass
+    # 3) config/settings.json ffmpeg_path
+    try:
+        import json
+        path = os.path.join('config', 'settings.json')
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                s = json.load(f)
+            p = (s.get('global') or s.get('globals') or {}).get('advanced') or {}
+            custom = (p.get('ffmpeg_path') or '').strip()
+            if custom and custom.lower() != 'ffmpeg' and os.path.isfile(custom):
+                res = os.path.abspath(custom)
+                logging.debug(f'TIDAL: Using ffmpeg from config: {res}')
+                return res
+    except Exception:
+        pass
+    logging.debug('TIDAL: Using ffmpeg from PATH')
+    return 'ffmpeg'
+
 from datetime import datetime
 from getpass import getpass
 from dataclasses import dataclass
@@ -21,12 +61,23 @@ from shutil import copyfileobj
 from xml.etree import ElementTree
 from tqdm import tqdm
 
+from utils.exceptions import InvalidInput
 from utils.models import *
 import os
 import tempfile
 from utils.utils import sanitise_name, silentremove, download_to_temp, create_temp_filename, create_requests_session
 from .mqa_identifier_python.mqa_identifier_python.mqa_identifier import MqaIdentifier
 from .tidal_api import TidalTvSession, TidalApi, TidalMobileSession, SessionType, TidalError, TidalRequestError
+
+def _bool_setting(settings: dict, key: str, default: bool) -> bool:
+    """Read a boolean from settings; handle string values from JSON/GUI (e.g. 'False'/'True')."""
+    v = settings.get(key, default)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ('1', 'true', 'yes')
+    return bool(v)
+
 
 module_information = ModuleInformation(
     service_name='TIDAL',
@@ -45,7 +96,8 @@ module_information = ModuleInformation(
     # flags=ModuleFlags.needs_cover_resize,
     session_storage_variables=['sessions'],
     netlocation_constant='tidal',
-    test_url='https://tidal.com/browse/track/92265335'
+    test_url='https://tidal.com/browse/track/92265335',
+    url_decoding=ManualEnum.manual,
 )
 
 
@@ -85,7 +137,7 @@ class ModuleInterface:
         if not saved_sessions:
             saved_sessions = {}
 
-        if not self.settings.get('enable_mobile', True):
+        if not _bool_setting(self.settings, 'enable_mobile', True):
             self.available_sessions = [SessionType.TV.name]
 
         while True:
@@ -227,6 +279,27 @@ class ModuleInterface:
     @staticmethod
     def _generate_animated_artwork_url(cover_id: str, size=1280):
         return 'https://resources.tidal.com/videos/{0}/{1}x{1}.mp4'.format(cover_id.replace('-', '/'), size)
+
+    def custom_url_parse(self, link: str):
+        # Match tidal.com and listen.tidal.com (e.g. https://listen.tidal.com/track/232917499)
+        match = re.search(
+            r'https?://(?:www\.|listen\.)?tidal\.com/(?:browse/)?'
+            r'(?P<media_type>track|album|playlist|artist)/'
+            r'(?P<media_id>[A-Za-z0-9-]+)',
+            link,
+        )
+        media_types = {
+            'track': DownloadTypeEnum.track,
+            'album': DownloadTypeEnum.album,
+            'playlist': DownloadTypeEnum.playlist,
+            'artist': DownloadTypeEnum.artist,
+        }
+        if not match:
+            raise InvalidInput(f'Unsupported URL: {link}')
+        return MediaIdentification(
+            media_type=media_types[match.group('media_type')],
+            media_id=match.group('media_id'),
+        )
 
     def search(self, query_type: DownloadTypeEnum, query: str, track_info: TrackInfo = None, limit: int = 20):
         if track_info and track_info.tags.isrc:
@@ -543,7 +616,8 @@ class ModuleInterface:
             if 'SONY_360RA' in media_tags:
                 format = '360ra'
             elif 'DOLBY_ATMOS' in media_tags:
-                if self.settings.get('prefer_ac4', False):
+                # prefer_ac4 False → TV session → E-AC-3 JOC (plays in VLC/Audacity). True → MOBILE_ATMOS → AC-4.
+                if _bool_setting(self.settings, 'prefer_ac4', False):
                     format = 'ac4'
                 else:
                     format = 'ac3'
@@ -610,15 +684,15 @@ class ModuleInterface:
                 download_args = {'audio_track': audio_track}
             else:
                 # check if MQA
-                if track_codec is CodecEnum.MQA and self.settings.get('fix_mqa', True):
+                if track_codec is CodecEnum.MQA and _bool_setting(self.settings, 'fix_mqa', True):
                     # download the first chunk of the flac file to analyze it
                     temp_file_path = self.download_temp_header(manifest['urls'][0])
 
                     # detect MQA file
                     mqa_file = MqaIdentifier(temp_file_path)
 
-                # add the file to download_args
-                download_args = {'file_url': manifest['urls'][0]}
+                # add the file to download_args (include codec so single-URL Atmos can be transcoded to AAC)
+                download_args = {'file_url': manifest['urls'][0], 'codec': track_codec}
 
         # https://en.wikipedia.org/wiki/Audio_bit_depth#cite_ref-1
         bit_depth = (24 if stream_data and stream_data['audioQuality'] == 'HI_RES_LOSSLESS' else 16) \
@@ -772,11 +846,11 @@ class ModuleInterface:
 
         return tracks
 
-    def get_track_download(self, file_url: str = None, audio_track: AudioTrack = None) \
+    def get_track_download(self, file_url: str = None, audio_track: AudioTrack = None, codec: CodecEnum = None, **kwargs) \
             -> TrackDownloadInfo:
         # only file_url or audio_track at a time
 
-        # MHA1, EC-3 or MQA
+        # Single URL (non-DASH): return URL as-is (no transcode)
         if file_url:
             return TrackDownloadInfo(download_type=DownloadEnum.URL, file_url=file_url)
 
@@ -802,7 +876,6 @@ class ModuleInterface:
 
         # concatenated/Merged .mp4 file
         merged_temp_location = create_temp_filename() + '.mp4'
-        # actual converted .flac file
         output_location = create_temp_filename() + '.' + codec_data[audio_track.codec].container.name
 
         # download is finished, merge chunks into 1 file
@@ -811,25 +884,24 @@ class ModuleInterface:
                 with open(temp_location, 'rb') as segment_file:
                     copyfileobj(segment_file, dest_file)
 
-        # convert .mp4 back to .flac
+        # Remux (stream copy) to final container; no transcode.
         try:
-            _get_ffmpeg().input(merged_temp_location, hide_banner=None, y=None).output(output_location, acodec='copy',
-                                                                                loglevel='error', map_metadata='-1').run()
-            # Remove all files
+            out_kw = dict(acodec='copy', loglevel='error', map_metadata='-1')
+            if output_location.lower().endswith(('.m4a', '.mp4')):
+                out_kw['movflags'] = '+faststart'
+            _get_ffmpeg().input(merged_temp_location, hide_banner=None, y=None).output(
+                output_location, **out_kw
+            ).run(cmd=_get_ffmpeg_cmd())
             silentremove(merged_temp_location)
             for temp_location in temp_locations:
                 silentremove(temp_location)
-        except:
+        except Exception:
             self.print('FFmpeg is not installed or working! Using fallback, may have errors')
-
-            # return the MP4 temp file, but tell orpheus to change the container to .m4a (AAC)
             return TrackDownloadInfo(
                 download_type=DownloadEnum.TEMP_FILE_PATH,
                 temp_file_path=merged_temp_location,
-                different_codec=CodecEnum.AAC
             )
 
-        # return the converted flac file now
         return TrackDownloadInfo(
             download_type=DownloadEnum.TEMP_FILE_PATH,
             temp_file_path=output_location,
