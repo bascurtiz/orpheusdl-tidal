@@ -76,7 +76,8 @@ class TidalApi(object):
         resp = self.s.get(
             self.TIDAL_API_BASE + url,
             headers=self.sessions[self.default.name].auth_headers(),
-            params=params)
+            params=params,
+            timeout=60)
 
         # if the request 401s or 403s, try refreshing the TV/Mobile session in case that helps
         if not refresh and (resp.status_code == 401 or resp.status_code == 403):
@@ -136,6 +137,21 @@ class TidalApi(object):
             local_params.update(params)
 
         return self._get('pages/' + pageurl, params=local_params)
+
+    def get_path(self, path, params=None):
+        """Call an arbitrary API path relative to TIDAL_API_BASE (e.g. showMore.apiPath or dataApiPath after stripping /v1/).
+        For paths starting with 'pages/', merges in deviceType, locale, and mediaFormats so the API does not return 400."""
+        if params is None:
+            params = {}
+        if path.startswith('pages/'):
+            page_params = {
+                'deviceType': 'TV',
+                'locale': 'en_US',
+                'mediaFormats': 'SONY_360',
+            }
+            page_params.update(params)
+            params = page_params
+        return self._get(path, params=params)
 
     def get_playlist_items(self, playlist_id):
         result = self._get('playlists/' + playlist_id + '/items', {

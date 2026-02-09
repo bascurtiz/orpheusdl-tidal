@@ -426,6 +426,218 @@ class ModuleInterface:
 
         return items
 
+    def explore(self, format_name: str, content_type: str, limit: int = 25):
+        """Browse Dolby Atmos releases (tracks, albums, or playlists) via Tidal pages API.
+        format_name: 'atmos'. content_type: 'tracks', 'albums', or 'playlists'.
+        Returns list of SearchResult with extra_kwargs.media_type set to track, album, or playlist."""
+        # Map to page and possible module titles (API may use different wording)
+        page_titles = {
+            ('atmos', 'tracks'): (('dolby_atmos', 'atmos'), ('Tracks', 'New Tracks', 'Dolby Atmos Tracks')),
+            ('atmos', 'albums'): (('dolby_atmos', 'atmos'), ('New Albums', 'Albums', 'Dolby Atmos Albums')),
+            ('atmos', 'playlists'): (('dolby_atmos', 'atmos'), ('Playlists', 'Dolby Atmos Playlists', 'Curated Playlists')),
+        }
+        key = (format_name.lower(), content_type.lower())
+        if key not in page_titles:
+            return []
+        page_options, title_options = page_titles[key]
+        page_options = (page_options,) if isinstance(page_options, str) else page_options
+        title_options = (title_options,) if isinstance(title_options, str) else title_options
+
+        page_content = None
+        page_used = None
+        for page in page_options:
+            try:
+                page_content = self.session.get_page(page)
+                page_used = page
+                break
+            except Exception as e:
+                continue
+        
+        if not page_content:
+            error_msg = f"Tidal explore: Failed to fetch any page from {page_options}"
+            logging.getLogger(__name__).warning(error_msg)
+            print(f"[Tidal Explore] {error_msg}")
+            return []
+
+        rows = page_content.get('rows') or []
+        show_more_path = None
+        for row in rows:
+            for mod in row.get('modules') or []:
+                mod_title = (mod.get('title') or '').strip()
+                if mod_title in title_options:
+                    show_more = mod.get('showMore') or {}
+                    api_path = (show_more.get('apiPath') or '').strip()
+                    if api_path:
+                        path = api_path.lstrip('/')
+                        if path.startswith('v1/'):
+                            path = path[3:]
+                        show_more_path = path
+                        break
+            if show_more_path:
+                break
+
+        if not show_more_path:
+            # Collect available module titles for debugging
+            available_titles = []
+            for row in rows:
+                for mod in row.get('modules') or []:
+                    title = mod.get('title')
+                    if title:
+                        available_titles.append(title)
+            error_msg = (
+                f"Tidal explore: Could not find module with title matching {title_options} "
+                f"on page '{page_used}'. Available titles: {available_titles[:10]}"
+            )
+            logging.getLogger(__name__).warning(error_msg)
+            print(f"[Tidal Explore] {error_msg}")
+            return []
+
+        try:
+            single_page = self.session.get_path(show_more_path)
+        except Exception as e1:
+            if not show_more_path.startswith('pages/'):
+                try:
+                    single_page = self.session.get_path('pages/' + show_more_path)
+                except Exception as e2:
+                    error_msg = f"Tidal explore: Failed to fetch path '{show_more_path}' and 'pages/{show_more_path}': {e1}, {e2}"
+                    logging.getLogger(__name__).warning(error_msg)
+                    print(f"[Tidal Explore] {error_msg}")
+                    return []
+            else:
+                error_msg = f"Tidal explore: Failed to fetch path '{show_more_path}': {e1}"
+                logging.getLogger(__name__).warning(error_msg)
+                print(f"[Tidal Explore] {error_msg}")
+                return []
+
+        rows2 = single_page.get('rows') or []
+        if not rows2:
+            error_msg = f"Tidal explore: No rows in response from path '{show_more_path}'"
+            logging.getLogger(__name__).warning(error_msg)
+            print(f"[Tidal Explore] {error_msg}")
+            return []
+        modules2 = (rows2[0].get('modules') or [{}])
+        paged_list = None
+        for m in modules2:
+            paged_list = m.get('pagedList')
+            if paged_list:
+                break
+        if not paged_list:
+            error_msg = f"Tidal explore: No pagedList found in response from '{show_more_path}'"
+            logging.getLogger(__name__).warning(error_msg)
+            print(f"[Tidal Explore] {error_msg}")
+            return []
+
+        total = paged_list.get('totalNumberOfItems', 0)
+        # Collect any items already in the first response (some modules put the first page here)
+        initial_items = []
+        for m in modules2:
+            initial_items.extend(m.get('items') or [])
+        items = list(initial_items)
+
+        data_api_path = (paged_list.get('dataApiPath') or '').strip()
+        if not data_api_path:
+            error_msg = f"Tidal explore: No dataApiPath in pagedList (total={total})"
+            logging.getLogger(__name__).warning(error_msg)
+            print(f"[Tidal Explore] {error_msg}")
+            return []
+        path = data_api_path.lstrip('/')
+        if path.startswith('v1/'):
+            path = path[3:]
+
+        page_size = 50
+        pagination_path = path if path.startswith('pages/') else 'pages/' + path
+        # Paginate from after initial items so we don't duplicate; request up to limit
+        start_offset = len(initial_items)
+        effective_total = max(total, start_offset)  # in case total was underreported
+        for offset in range(start_offset, min(effective_total, limit), page_size):
+            if len(items) >= limit:
+                break
+            try:
+                resp = self.session.get_path(pagination_path, params={'offset': offset, 'limit': page_size})
+            except Exception:
+                try:
+                    resp = self.session.get_path(path, params={'offset': offset, 'limit': page_size})
+                except Exception:
+                    break
+            batch = resp.get('items') or []
+            for it in batch:
+                if len(items) >= limit:
+                    break
+                items.append(it)
+
+        results = []
+        is_playlist_content = content_type.lower() == 'playlists'
+        for i in items:
+            if is_playlist_content:
+                # Playlist item: uuid, title, creator, numberOfTracks, squareImage, duration, created
+                media_type = DownloadTypeEnum.playlist
+                name = (i.get('title') or '')
+                if i.get('version'):
+                    name += f' ({i["version"]})'
+                creator = i.get('creator') or {}
+                artists = [creator.get('name')] if creator.get('name') else (['Tidal'] if i.get('type') == 'EDITORIAL' else ['Unknown'])
+                year = None
+                created = i.get('created')
+                if created:
+                    year = str(created)[:4]
+                duration = i.get('duration')
+                image_url = None
+                cover_id = i.get('squareImage') or i.get('image') or i.get('cover') or i.get('picture')
+                if cover_id:
+                    image_url = self._generate_artwork_url(cover_id, size=56, max_size=1080)
+                track_count = i.get('numberOfTracks') or i.get('number_of_tracks')
+                additional = f"{track_count} tracks" if track_count is not None else None
+                result_id = i.get('uuid') or str(i.get('id', ''))
+            else:
+                is_album = 'album' in (i.get('url') or '')
+                media_type = DownloadTypeEnum.album if is_album else DownloadTypeEnum.track
+
+                name = (i.get('title') or '')
+                if i.get('version'):
+                    name += f' ({i["version"]})'
+                artists = [j.get('name') for j in (i.get('artists') or []) if j.get('name')]
+                if not artists:
+                    artists = ['Unknown']
+
+                year = None
+                release_date = i.get('releaseDate') or i.get('streamStartDate')
+                if release_date:
+                    year = str(release_date)[:4]
+                duration = i.get('duration')
+
+                image_url = None
+                cover_id = i.get('cover') or (i.get('album') or {}).get('cover')
+                if cover_id:
+                    image_url = self._generate_artwork_url(cover_id, size=56)
+
+                additional = None
+                audio_modes = i.get('audioModes') or []
+                if 'DOLBY_ATMOS' in audio_modes:
+                    additional = 'Dolby Atmos'
+                elif 'SONY_360RA' in audio_modes:
+                    additional = '360 Reality Audio'
+                elif i.get('audioQuality') == 'HI_RES':
+                    additional = 'MQA'
+                else:
+                    additional = 'HiFi'
+
+                result_id = str(i.get('id', ''))
+
+            results.append(SearchResult(
+                name=name,
+                artists=artists,
+                year=year,
+                result_id=result_id,
+                explicit=i.get('explicit', False),
+                duration=duration,
+                additional=[additional] if additional else None,
+                image_url=image_url,
+                preview_url=None,
+                extra_kwargs={'raw_result': i, 'media_type': media_type},
+            ))
+
+        return results
+
     def get_playlist_info(self, playlist_id: str) -> PlaylistInfo:
         playlist_data = self.session.get_playlist(playlist_id)
         playlist_tracks = self.session.get_playlist_items(playlist_id)
