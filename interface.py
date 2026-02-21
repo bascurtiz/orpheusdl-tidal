@@ -125,7 +125,8 @@ class ModuleInterface:
             QualityEnum.MEDIUM: 'HIGH',
             QualityEnum.HIGH: 'HIGH',
             QualityEnum.LOSSLESS: 'LOSSLESS',
-            QualityEnum.HIFI: 'HI_RES'
+            QualityEnum.HIFI: 'HI_RES_LOSSLESS',
+            QualityEnum.ATMOS: 'HI_RES_LOSSLESS'
         }
 
         # save all the TidalSession objects
@@ -824,7 +825,7 @@ class ModuleInterface:
 
         media_tags = track_data['mediaMetadata']['tags']
         format = None
-        if codec_options.spatial_codecs:
+        if codec_options.spatial_codecs and quality_tier is QualityEnum.ATMOS:
             if 'SONY_360RA' in media_tags:
                 format = '360ra'
             elif 'DOLBY_ATMOS' in media_tags:
@@ -934,6 +935,10 @@ class ModuleInterface:
         # more precise bitrate tidal uses MPEG-DASH
         if audio_track:
             bitrate = audio_track.bitrate // 1000
+            # Snap Tidal lossy bitrates to standard values for cleaner display
+            if 310 <= bitrate <= 330: bitrate = 320
+            elif 90 <= bitrate <= 110: bitrate = 96
+
             if stream_data['audioQuality'] == 'HI_RES_LOSSLESS':
                 sample_rate = audio_track.sample_rate / 1000
 
