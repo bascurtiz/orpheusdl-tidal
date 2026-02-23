@@ -52,6 +52,7 @@ class SessionType(Enum):
     TV = auto()
     MOBILE_ATMOS = auto()
     MOBILE_DEFAULT = auto()
+    GUEST = auto()
 
 
 class TidalApi(object):
@@ -65,24 +66,25 @@ class TidalApi(object):
 
         self.s = create_requests_session()
 
-    def _get(self, url, params=None, refresh=False):
+    def _get(self, url, params=None, refresh=False, session_override=None):
         if params is None:
             params = {}
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        params['countryCode'] = self.sessions[self.default.name].country_code
-        if 'limit' not in params:
-            params['limit'] = '9999'
+        session = session_override or self.sessions[self.default.name]
+        params['countryCode'] = session.country_code
+        # if 'limit' not in params:
+        #     params['limit'] = '9999'
 
         resp = self.s.get(
             self.TIDAL_API_BASE + url,
-            headers=self.sessions[self.default.name].auth_headers(),
+            headers=session.auth_headers(),
             params=params,
             timeout=60)
 
-        # if the request 401s or 403s, try refreshing the TV/Mobile session in case that helps
+        # if the request 401s or 403s, try refreshing the session in case that helps
         if not refresh and (resp.status_code == 401 or resp.status_code == 403):
-            self.sessions[self.default.name].refresh()
-            return self._get(url, params, True)
+            session.refresh()
+            return self._get(url, params, True, session_override)
 
         resp_json = None
         try:
@@ -117,6 +119,75 @@ class TidalApi(object):
             'audioquality': quality,
             'prefetch': 'false'
         })
+
+    def get_track_preview_url(self, track_id, session_override=None):
+        """Fetch a 30-second preview for a track. Uses PREVIEW assetpresentation.
+        Returns manifest data if available, or None if not accessible.
+        If session_override is given, uses that session instead of the default."""
+        try:
+            return self._get('tracks/' + str(track_id) + '/playbackinfopostpaywall/v4', {
+                'playbackmode': 'STREAM',
+                'assetpresentation': 'PREVIEW',
+                'audioquality': 'LOW',
+                'prefetch': 'false'
+            }, session_override=session_override)
+        except Exception:
+            return None
+
+    def get_track_preview_v2(self, track_id, session_override=None):
+        """Fetch a 30-second preview using Tidal's v2 OpenAPI (same as the web player).
+        Uses openapi.tidal.com/v2/trackManifests — works with client_credentials tokens.
+        Returns a dict with 'manifestMimeType' and 'manifest' keys, or None."""
+        session = session_override or self.sessions.get(SessionType.GUEST.name) or self.sessions[self.default.name]
+        try:
+            # Ensure token is fresh
+            if hasattr(session, 'expires') and session.expires and datetime.now() > session.expires:
+                session.refresh()
+
+            resp = self.s.get(
+                'https://openapi.tidal.com/v2/trackManifests/' + str(track_id),
+                headers={
+                    'Authorization': 'Bearer {}'.format(session.access_token),
+                    'Accept': 'application/vnd.api+json',
+                },
+                params={
+                    'countryCode': session.country_code or 'US',
+                    'adaptive': 'false',
+                    'formats': 'AACLC',
+                    'manifestType': 'MPEG_DASH',
+                    'uriScheme': 'DATA',
+                    'usage': 'PLAYBACK',
+                },
+                timeout=30
+            )
+
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            # v2 API returns JSON:API format: data.attributes.uri
+            # The uri is a data URI like "data:application/dash+xml;base64,XXXX"
+            attrs = data.get('data', {}).get('attributes', {})
+            raw_uri = attrs.get('uri', '')
+            if not raw_uri:
+                return None
+
+            # Strip data URI prefix to get raw base64 content
+            # Format: "data:<mime>;base64,<data>"
+            manifest_b64 = raw_uri
+            if raw_uri.startswith('data:'):
+                # Extract MIME type and base64 data
+                comma_idx = raw_uri.find(',')
+                if comma_idx != -1:
+                    manifest_b64 = raw_uri[comma_idx + 1:]
+
+            # Return in the same format as v1 for compatibility
+            return {
+                'manifestMimeType': 'application/dash+xml',
+                'manifest': manifest_b64,
+            }
+        except Exception:
+            return None
 
     def get_search_data(self, search_term, limit=20):
         return self._get('search', params={
@@ -614,4 +685,52 @@ class TidalTvSession(TidalSession):
             'Connection': 'Keep-Alive',
             'Accept-Encoding': 'gzip',
             'User-Agent': 'TIDAL_ANDROID/1039 okhttp/3.14.9'
+        }
+
+
+class TidalGuestSession(TidalSession):
+    """
+    Tidal session object for guest/unauthenticated access
+    """
+
+    def __init__(self, client_id: str, client_secret: str):
+        super().__init__()
+        self.TIDAL_AUTH_BASE = 'https://auth.tidal.com/v1/'
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+
+    def auth(self):
+        r = requests.post(self.TIDAL_AUTH_BASE + 'oauth2/token', data={
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'grant_type': 'client_credentials'
+        }, headers={
+            'User-Agent': self.user_agent,
+            'Origin': 'https://tidal.com',
+            'Referer': 'https://tidal.com/'
+        })
+
+        if r.status_code != 200:
+            raise TidalAuthError(f"Guest authorization failed: {r.text}")
+
+        data = r.json()
+        self.access_token = data['access_token']
+        self.expires = datetime.now() + timedelta(seconds=data['expires_in'])
+        # Guest sessions don't have user_id, but country_code can be defaulted or fetched
+        # For search, US or a common code is usually fine if not provided
+        self.country_code = 'US'
+
+    def refresh(self):
+        return self.auth()
+
+    @staticmethod
+    def session_type():
+        return 'Guest'
+
+    def auth_headers(self):
+        return {
+            'X-Tidal-Token': self.client_id,
+            'Authorization': 'Bearer {}'.format(self.access_token),
+            'User-Agent': self.user_agent
         }

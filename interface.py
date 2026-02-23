@@ -1,7 +1,9 @@
 import base64
 import json
 import logging
+import os
 import re
+import sys
 
 # Lazy import ffmpeg to avoid circular import issues in PyInstaller bundles
 _ffmpeg_module = None
@@ -67,7 +69,7 @@ import os
 import tempfile
 from utils.utils import sanitise_name, silentremove, download_to_temp, create_temp_filename, create_requests_session
 from .mqa_identifier_python.mqa_identifier_python.mqa_identifier import MqaIdentifier
-from .tidal_api import TidalTvSession, TidalApi, TidalMobileSession, SessionType, TidalError, TidalRequestError
+from .tidal_api import TidalTvSession, TidalApi, TidalMobileSession, TidalGuestSession, SessionType, TidalError, TidalRequestError
 
 def _bool_setting(settings: dict, key: str, default: bool) -> bool:
     """Read a boolean from settings; handle string values from JSON/GUI (e.g. 'False'/'True')."""
@@ -88,6 +90,8 @@ module_information = ModuleInformation(
         'tv_atmos_secret': 'oKOXfJW371cX6xaZ0PyhgGNBdNLlBZd4AKKYougMjik=',
         'mobile_atmos_hires_token': 'km8T1xS355y7dd3H',
         'mobile_hires_token': '6BDSRdpK9hqEBTgU',
+        'guest_token': 'txNoH4kkV41MfH25',
+        'guest_secret': 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=',
         'enable_mobile': True,
         'prefer_ac4': False,
         'fix_mqa': True
@@ -112,6 +116,7 @@ class AudioTrack:
 class ModuleInterface:
     # noinspection PyTypeChecker
     def __init__(self, module_controller: ModuleController):
+        self.module_controller = module_controller
         self.cover_size = module_controller.orpheus_options.default_cover_options.resolution
         self.oprinter = module_controller.printer_controller
         self.print = module_controller.printer_controller.oprint
@@ -141,16 +146,28 @@ class ModuleInterface:
         if not _bool_setting(self.settings, 'enable_mobile', True):
             self.available_sessions = [SessionType.TV.name]
 
+        # Check if we should use guest mode (if no sessions exist)
+        use_guest = not saved_sessions
+
         while True:
             login_session = None
 
             def auth_and_save_session(session, session_type):
                 session = self.auth_session(session, session_type, login_session)
 
-                # get the dict representation from the TidalSession object and save it into saved_session/loginstorage
-                saved_sessions[session_type] = session.get_storage()
-                module_controller.temporary_settings_controller.set('sessions', saved_sessions)
+                # guest sessions are not saved
+                if session_type != SessionType.GUEST.name:
+                    # get the dict representation from the TidalSession object and save it into saved_session/loginstorage
+                    saved_sessions[session_type] = session.get_storage()
+                    module_controller.temporary_settings_controller.set('sessions', saved_sessions)
                 return session
+
+            if use_guest:
+                logging.debug(f'{module_information.service_name}: No saved sessions, initializing guest session')
+                guest_session_type = SessionType.GUEST.name
+                sessions[guest_session_type] = auth_and_save_session(self.init_session(guest_session_type), guest_session_type)
+                # For guest mode, we only need this one session
+                break
 
             # ask for login if there are no saved sessions
             if not saved_sessions:
@@ -221,6 +238,8 @@ class ModuleInterface:
 
         # load the Tidal session with all saved sessions (TV, Mobile Atmos, Mobile Default)
         self.session: TidalApi = TidalApi(sessions)
+        if use_guest:
+            self.session.default = SessionType.GUEST
 
     def init_session(self, session_type):
         session = None
@@ -232,6 +251,11 @@ class ModuleInterface:
             )
         elif session_type == SessionType.MOBILE_ATMOS.name:
             session = TidalMobileSession(self.settings.get('mobile_atmos_hires_token', 'km8T1xS355y7dd3H'))
+        elif session_type == SessionType.GUEST.name:
+            session = TidalGuestSession(
+                self.settings.get('guest_token', 'txNoH4kkV41MfH25'),
+                self.settings.get('guest_secret', 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=')
+            )
         else:
             session = TidalMobileSession(self.settings.get('mobile_hires_token', '6BDSRdpK9hqEBTgU'))
         return session
@@ -247,6 +271,9 @@ class ModuleInterface:
         elif session_type == SessionType.TV.name:
             self.print(f'{module_information.service_name}: Creating a TV session')
             session.auth()
+        elif session_type == SessionType.GUEST.name:
+            logging.debug(f'{module_information.service_name}: Creating a Guest session')
+            session.auth()
         else:
             self.print(f'{module_information.service_name}: Creating a Mobile session')
             self.print(f'{module_information.service_name}: Enter your TIDAL username and password:')
@@ -260,11 +287,77 @@ class ModuleInterface:
 
     def check_subscription(self, subscription: str) -> bool:
         # returns true if "disable_subscription_checks" is enabled or subscription is HIFI (Plus)
-        if not self.disable_subscription_check and subscription not in {'HIFI', 'PREMIUM', 'PREMIUM_PLUS'}:
+        sub = subscription.upper()
+        if not self.disable_subscription_check and not ('HIFI' in sub or 'PREMIUM' in sub or 'TIDAL_PLUS' in sub):
             self.print(f'{module_information.service_name}: Account does not have a HiFi (Plus) subscription, '
                        f'detected subscription: {subscription}')
             return False
         return True
+
+    def _ensure_credentials(self):
+        # Check if we are in guest mode (only GUEST session exists)
+        if SessionType.GUEST.name in self.session.sessions and len(self.session.sessions) == 1:
+            # Temporarily reset default to GUEST so API calls still work during login
+            # (get_track_info may have set default to TV before calling us)
+            previous_default = self.session.default
+            self.session.default = SessionType.GUEST
+
+            self.print(f'{module_information.service_name}: Credentials missing. Please login to download tracks.', drop_level=1)
+            # Prompt for login
+            saved_sessions = {}
+            while True:
+                login_session_type = None
+                is_gui_mode = os.environ.get('ORPHEUS_GUI') == '1'
+                if is_gui_mode:
+                    # GUI mode: auto-select TV (browser) since we can't do interactive input
+                    self.print(f'{module_information.service_name}: GUI mode detected, automatically using TV (browser) login.')
+                    login_session_type = SessionType.TV.name
+                else:
+                    # CLI mode: always show the login method prompt
+                    self.print(f'{module_information.service_name}: Choose a login method:')
+                    self.print(f'{module_information.service_name}: 1. TV (browser)')
+                    self.print(
+                        f"{module_information.service_name}: 2. Mobile (username and password, choose TV if this doesn't work)")
+
+                    while not login_session_type:
+                        input_str = input(' Login method: ')
+                        try:
+                            login_session_type = {
+                                '1': SessionType.TV.name,
+                                'tv': SessionType.TV.name,
+                                '2': SessionType.MOBILE_DEFAULT.name,
+                                'mobile': SessionType.MOBILE_DEFAULT.name,
+                            }[input_str.lower()]
+                        except KeyError:
+                            self.print(f'{module_information.service_name}: Invalid choice, try again')
+
+                # Re-initialize all sessions after login
+                login_session = self.auth_session(self.init_session(login_session_type), login_session_type, None)
+                saved_sessions[login_session_type] = login_session.get_storage()
+                
+                # Also auth other mobile sessions if mobile was chosen
+                for session_type in self.available_sessions:
+                    if session_type not in saved_sessions:
+                        session = self.init_session(session_type)
+                        session.refresh_token = login_session.refresh_token
+                        session.user_id = login_session.user_id
+                        session.country_code = login_session.country_code
+                        session.refresh()
+                        saved_sessions[session_type] = session.get_storage()
+                
+                # Save to temporary settings
+                self.module_controller.temporary_settings_controller.set('sessions', saved_sessions)
+                
+                # Re-initialize the API with new sessions
+                new_sessions = {}
+                for st in self.available_sessions:
+                    s = self.init_session(st)
+                    s.set_storage(saved_sessions[st])
+                    new_sessions[st] = s
+                
+                self.session.sessions = new_sessions
+                self.session.default = SessionType.TV # reset default to TV after successful login
+                break
 
     @staticmethod
     def _generate_artwork_url(cover_id: str, size: int, max_size: int = 1280):
@@ -376,9 +469,9 @@ class ModuleInterface:
                 # Track cover image (from album) - use 56px for search thumbnails
                 if album_data.get('cover'):
                     image_url = self._generate_artwork_url(album_data.get('cover'), size=56)
-                # Preview URL - Tidal may not provide preview URLs in search results
-                # Leave as None, GUI can handle lazy-loading if needed
-                preview_url = None
+                # Preview URL - use previewUrl from search results if available
+                # The GUI handles lazy-loading via get_preview_stream_url for tracks without it
+                preview_url = i.get('previewUrl')
             elif query_type is DownloadTypeEnum.album:
                 artists = [j.get('name') for j in i.get('artists')]
                 duration = i.get('duration')
@@ -393,16 +486,10 @@ class ModuleInterface:
                 name = i.get('title')
                 name += f' ({i.get("version")})' if i.get("version") else ''
 
-            additional = None
+            additional = []
             if query_type not in {DownloadTypeEnum.artist, DownloadTypeEnum.playlist}:
-                if 'DOLBY_ATMOS' in i.get('audioModes'):
-                    additional = "Dolby Atmos"
-                elif 'SONY_360RA' in i.get('audioModes'):
-                    additional = "360 Reality Audio"
-                elif i.get('audioQuality') == 'HI_RES':
-                    additional = "MQA"
-                else:
-                    additional = 'HiFi'
+                formatted = self._format_additional_info(i)
+                additional = [formatted] if formatted else None
             elif query_type is DownloadTypeEnum.playlist and playlist_track_count is not None:
                 additional = [f"1 track" if playlist_track_count == 1 else f"{playlist_track_count} tracks"]
 
@@ -611,16 +698,18 @@ class ModuleInterface:
                 if cover_id:
                     image_url = self._generate_artwork_url(cover_id, size=56)
 
-                additional = None
+                additional_list = []
                 audio_modes = i.get('audioModes') or []
-                if 'DOLBY_ATMOS' in audio_modes:
-                    additional = 'Dolby Atmos'
-                elif 'SONY_360RA' in audio_modes:
-                    additional = '360 Reality Audio'
-                elif i.get('audioQuality') == 'HI_RES':
-                    additional = 'MQA'
-                else:
-                    additional = 'HiFi'
+                tags = i.get('mediaMetadata', {}).get('tags', [])
+                
+                if 'DOLBY_ATMOS' in tags or 'DOLBY_ATMOS' in audio_modes:
+                    additional_list.append('Dolby Atmos')
+                if 'SONY_360RA' in tags or 'SONY_360RA' in audio_modes:
+                    additional_list.append('360 Reality Audio')
+                if 'HIRES_LOSSLESS' in tags or i.get('audioQuality') == 'HI_RES':
+                    additional_list.append('Hi Res Lossless')
+                
+                additional = " | ".join(additional_list) if additional_list else None
 
                 result_id = str(i.get('id', ''))
 
@@ -644,6 +733,12 @@ class ModuleInterface:
         playlist_tracks = self.session.get_playlist_items(playlist_id)
 
         tracks = [track.get('item').get('id') for track in playlist_tracks.get('items') if track.get('type') == 'track']
+        track_data_dict = {}
+        for track in playlist_tracks.get('items'):
+            item = track.get('item')
+            if item:
+                item['additional'] = self._format_additional_info(item)
+                track_data_dict[item.get('id')] = item
 
         if 'name' in playlist_data.get('creator'):
             creator_name = playlist_data.get('creator').get('name')
@@ -660,6 +755,33 @@ class ModuleInterface:
             cover_url = 'https://tidal.com/browse/assets/images/defaultImages/defaultPlaylistImage.png'
             cover_type = ImageFileTypeEnum.png
 
+        # In guest-only mode, return TrackInfo objects so the GUI won't call get_track_info
+        if self._is_guest_only() and track_data_dict:
+            track_objects = []
+            for tid in tracks:
+                td = track_data_dict.get(tid, {})
+                track_name = td.get('title', 'Unknown')
+                if td.get('version'):
+                    track_name += f' ({td["version"]})'
+                track_cover = cover_url
+                if td.get('album', {}).get('cover'):
+                    track_cover = self._generate_artwork_url(td['album']['cover'], size=self.cover_size)
+                track_objects.append(TrackInfo(
+                    name=track_name,
+                    album=td.get('album', {}).get('title', ''),
+                    album_id=str(td.get('album', {}).get('id', '')),
+                    artists=[a.get('name') for a in td.get('artists', []) if a.get('name')],
+                    tags=Tags(),
+                    codec=CodecEnum.FLAC,
+                    cover_url=track_cover,
+                    release_year=str(td.get('streamStartDate', ''))[:4] if td.get('streamStartDate') else None,
+                    duration=td.get('duration'),
+                    explicit=td.get('explicit'),
+                    id=str(tid),
+                    additional=td.get('additional')
+                ))
+            tracks = track_objects
+
         return PlaylistInfo(
             name=playlist_data.get('title'),
             creator=creator_name,
@@ -670,7 +792,7 @@ class ModuleInterface:
             cover_url=cover_url,
             cover_type=cover_type,
             track_extra_kwargs={
-                'data': {track.get('item').get('id'): track.get('item') for track in playlist_tracks.get('items')}
+                'data': track_data_dict
             }
         )
 
@@ -682,39 +804,54 @@ class ModuleInterface:
 
         # Only works with a mobile session, annoying, never do this again
         credit_albums = []
-        if get_credited_albums and SessionType.MOBILE_DEFAULT.name in self.available_sessions:
-            self.session.default = SessionType.MOBILE_DEFAULT
-            credited_albums_page = self.session.get_page('contributor', params={'artistId': artist_id})
+        if get_credited_albums:
+            previous_default = self.session.default
+            try:
+                # Only attempt if MOBILE_DEFAULT session exists (requires login)
+                if SessionType.MOBILE_DEFAULT.name in self.session.sessions:
+                    self.session.default = SessionType.MOBILE_DEFAULT
+                    credited_albums_page = self.session.get_page('contributor', params={'artistId': artist_id})
 
-            # This is so retarded
-            page_list = credited_albums_page['rows'][-1]['modules'][0].get('pagedList')
-            if page_list:
-                total_items = page_list['totalNumberOfItems']
-                more_items_link = page_list['dataApiPath'][6:]
+                    # This is so retarded
+                    page_list = credited_albums_page['rows'][-1]['modules'][0].get('pagedList')
+                    if page_list:
+                        total_items = page_list['totalNumberOfItems']
+                        more_items_link = page_list['dataApiPath'][6:]
 
-                # Now fetch all the found total_items
-                items = []
-                for offset in range(0, total_items // 50 + 1):
-                    print(f'Fetching {offset * 50}/{total_items}', end='\r')
-                    items += self.session.get_page(more_items_link, params={'limit': 50, 'offset': offset * 50})[
-                        'items']
+                        # Now fetch all the found total_items
+                        items = []
+                        for offset in range(0, total_items // 50 + 1):
+                            print(f'Fetching {offset * 50}/{total_items}', end='\r')
+                            items += self.session.get_page(more_items_link, params={'limit': 50, 'offset': offset * 50})[
+                                'items']
 
-                credit_albums = [item.get('item').get('album') for item in items]
-                self.session.default = SessionType.TV
+                        credit_albums = [item.get('item').get('album') for item in items]
+            except Exception as e:
+                logging.debug(f'{module_information.service_name}: Could not fetch credited albums: {e}')
+            finally:
+                self.session.default = previous_default
 
         # use set to filter out duplicate album ids
         albums = {str(album.get('id')) for album in artist_albums + artist_singles + credit_albums}
         # Include credit_albums in album_extra_kwargs so GUI has full album data (title, artist, cover) for all albums
-        all_album_dicts = {str(a.get('id')): a for a in artist_albums + artist_singles}
-        for alb in credit_albums:
-            if alb and alb.get('id') is not None:
-                all_album_dicts[str(alb.get('id'))] = alb
+        all_album_dicts = {}
+        for a in artist_albums + artist_singles + credit_albums:
+            if a and a.get('id') is not None:
+                aid = str(a.get('id'))
+                # Add formatted traits to the album dict so it shows in GUI expanded list
+                a['additional'] = self._format_additional_info(a)
+                all_album_dicts[aid] = a
 
         return ArtistInfo(
             name=artist_data.get('name'),
             albums=list(albums),
             album_extra_kwargs={'data': all_album_dicts}
         )
+
+    def _is_guest_only(self):
+        """Check if we only have a guest session (no authenticated user sessions)."""
+        return (SessionType.GUEST.name in self.session.sessions and
+                len(self.session.sessions) == 1)
 
     def get_album_info(self, album_id: str, data=None) -> AlbumInfo:
         # check if album is already in album cache, add it
@@ -745,22 +882,29 @@ class ModuleInterface:
             # add the track contributors to a new list called 'credits'
             cache = {'data': {}}
             for track in tracks_data.get('items'):
-                track.get('item').update({'credits': track.get('credits')})
-                cache.get('data')[str(track.get('item').get('id'))] = track.get('item')
+                item = track.get('item')
+                item.update({'credits': track.get('credits')})
+                # Add formatted traits to the track dict
+                item['additional'] = self._format_additional_info(item)
+                cache.get('data')[str(item.get('id'))] = item
 
             # filter out video clips
-            tracks = [str(track['item']['id']) for track in tracks_data.get('items') if track.get('type') == 'track']
+            # return full track dicts with additional info (traits) already set
+            tracks = [cache['data'][tid] for tid in [str(track['item']['id']) for track in tracks_data.get('items') if track.get('type') == 'track'] if tid in cache['data']]
         except TidalError:
             tracks = []
 
-        quality = None
+        quality_list = []
         if 'audioModes' in album_data:
-            if album_data['audioModes'] == ['DOLBY_ATMOS']:
-                quality = 'Dolby Atmos'
-            elif album_data['audioModes'] == ['SONY_360RA']:
-                quality = '360'
-            elif album_data['audioQuality'] == 'HI_RES':
-                quality = 'M'
+            if 'DOLBY_ATMOS' in album_data['audioModes']:
+                quality_list.append('Dolby Atmos')
+            if 'SONY_360RA' in album_data['audioModes']:
+                quality_list.append('360 Reality Audio')
+        
+        if album_data.get('audioQuality') == 'HI_RES':
+            quality_list.append('Hi Res Lossless')
+        
+        quality = " | ".join(quality_list) if quality_list else None
 
         release_year = None
         if album_data.get('releaseDate'):
@@ -781,6 +925,34 @@ class ModuleInterface:
             cover_url = 'https://tidal.com/browse/assets/images/defaultImages/defaultAlbumImage.png'
             cover_type = ImageFileTypeEnum.png
 
+        # In guest-only mode, return TrackInfo objects so the GUI can display the tracklist
+        # without calling get_track_info() (which requires login for stream URLs).
+        if self._is_guest_only() and cache.get('data'):
+            track_objects = []
+            for tid in tracks:
+                td = cache['data'].get(tid, {})
+                track_name = td.get('title', 'Unknown')
+                if td.get('version'):
+                    track_name += f' ({td["version"]})'
+                track_cover = cover_url
+                if td.get('album', {}).get('cover'):
+                    track_cover = self._generate_artwork_url(td['album']['cover'], size=self.cover_size)
+                track_objects.append(TrackInfo(
+                    name=track_name,
+                    album=album_data.get('title', ''),
+                    album_id=album_id,
+                    artists=[a.get('name') for a in td.get('artists', []) if a.get('name')],
+                    tags=Tags(),
+                    codec=CodecEnum.FLAC,
+                    cover_url=track_cover,
+                    release_year=release_year,
+                    duration=td.get('duration'),
+                    explicit=td.get('explicit'),
+                    id=str(tid),
+                    additional=td.get('additional')
+                ))
+            tracks = track_objects
+
         return AlbumInfo(
             name=album_data.get('title'),
             release_year=release_year,
@@ -799,7 +971,7 @@ class ModuleInterface:
         )
 
     def get_track_info(self, track_id: str, quality_tier: QualityEnum, codec_options: CodecOptions,
-                       data=None) -> TrackInfo:
+                       data=None, **kwargs) -> TrackInfo:
         if data is None:
             data = {}
 
@@ -859,6 +1031,9 @@ class ModuleInterface:
 
         # define all default values in case the stream_data is None (region locked)
         audio_track, mqa_file, track_codec, bitrate, download_args, error = None, None, CodecEnum.FLAC, None, None, None
+
+        # Ensure we have credentials before fetching stream URL
+        self._ensure_credentials()
 
         try:
             stream_data = self.session.get_stream_url(track_id, self.quality_parse[
@@ -976,7 +1151,8 @@ class ModuleInterface:
             download_extra_kwargs=download_args,
             lyrics_extra_kwargs={'track_data': track_data},
             # check if 'credits' are present (only from get_album_data)
-            credits_extra_kwargs={'data': {track_id: track_data['credits']} if 'credits' in track_data else {}}
+            credits_extra_kwargs={'data': {track_id: track_data['credits']} if 'credits' in track_data else {}},
+            additional=self._format_additional_info(track_data)
         )
 
         if error is not None:
@@ -1198,71 +1374,6 @@ class ModuleInterface:
             return [CreditsInfo(sanitise_name(k), v) for k, v in credits_dict.items()]
         return None
 
-    def get_preview_stream_url(self, track_id: str) -> Optional[str]:
-        """
-        Get a playable preview for a track using LOW quality (96kbit/s AAC).
-        Downloads init + first media segments to a temp file so the GUI can play it.
-        Returns the path to the temp .m4a file, or None if unavailable.
-        """
-        try:
-            stream_data = self.session.get_stream_url(track_id, 'LOW')
-            if stream_data is None:
-                return None
-
-            preview_path = None
-            if stream_data.get('manifestMimeType') == 'application/dash+xml':
-                try:
-                    manifest = base64.b64decode(stream_data['manifest'])
-                    audio_tracks = self.parse_mpd(manifest)
-                    if not audio_tracks:
-                        return None
-                    urls = audio_tracks[0].urls
-                    if not urls:
-                        return None
-                    # Download init + up to 10 media segments (~30s) and concatenate into one .m4a
-                    num_media = min(10, max(0, len(urls) - 1))
-                    if num_media == 0:
-                        return None
-                    segment_paths = []
-                    try:
-                        for i in range(1 + num_media):
-                            seg_path = download_to_temp(urls[i], extension='mp4')
-                            segment_paths.append(seg_path)
-                        preview_path = os.path.join(tempfile.gettempdir(), f'orpheus_tidal_preview_{track_id}.m4a')
-                        with open(preview_path, 'wb') as out:
-                            for p in segment_paths:
-                                with open(p, 'rb') as f:
-                                    out.write(f.read())
-                    finally:
-                        for p in segment_paths:
-                            silentremove(p)
-                    if preview_path and os.path.exists(preview_path) and os.path.getsize(preview_path) > 0:
-                        return preview_path
-                    silentremove(preview_path)
-                    return None
-                except Exception as e:
-                    logging.debug(f'{module_information.service_name}: Error building DASH preview: {e}')
-                    return None
-            else:
-                try:
-                    manifest = json.loads(base64.b64decode(stream_data['manifest']))
-                    urls = manifest.get('urls', [])
-                    if not urls:
-                        return None
-                    preview_path = download_to_temp(urls[0], extension='m4a')
-                    if preview_path and os.path.exists(preview_path) and os.path.getsize(preview_path) > 0:
-                        return preview_path
-                    silentremove(preview_path)
-                    return None
-                except Exception as e:
-                    logging.debug(f'{module_information.service_name}: Error building JSON preview: {e}')
-                    return None
-        except (TidalError, TidalRequestError) as e:
-            logging.debug(f'{module_information.service_name}: Could not get preview for track {track_id}: {e}')
-            return None
-        except Exception as e:
-            logging.debug(f'{module_information.service_name}: Error getting preview for track {track_id}: {e}')
-            return None
 
     @staticmethod
     def convert_tags(track_data: dict, album_data: dict, mqa_file: MqaIdentifier = None) -> Tags:
@@ -1292,3 +1403,132 @@ class ModuleInterface:
             replay_peak=track_data.get('peak'),
             extra_tags=extra_tags
         )
+
+    def _ensure_guest_session(self):
+        """Ensure a guest (client_credentials) session exists for preview playback.
+        Creates one on-the-fly if not already present."""
+        guest_key = SessionType.GUEST.name
+        if guest_key in self.session.sessions:
+            guest = self.session.sessions[guest_key]
+            # Refresh if expired
+            if hasattr(guest, 'expires') and guest.expires and datetime.now() > guest.expires:
+                try:
+                    guest.refresh()
+                except Exception:
+                    pass
+            return guest
+        # No guest session exists — create one
+        try:
+            guest = TidalGuestSession(
+                self.settings.get('guest_token', 'txNoH4kkV41MfH25'),
+                self.settings.get('guest_secret', 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=')
+            )
+            guest.auth()
+            self.session.sessions[guest_key] = guest
+            return guest
+        except Exception as e:
+            logging.debug(f'{module_information.service_name}: Could not create guest session for preview: {e}')
+            return None
+
+    def get_preview_stream_url(self, track_id: str):
+        """Fetch a 30-second preview stream URL for a track.
+        Works without user login by using a guest (client_credentials) session.
+        Tries v1 PREVIEW API first, then falls back to v2 OpenAPI (web player API).
+        Returns a playable audio URL/path or None."""
+        guest = self._ensure_guest_session()
+        if not guest:
+            logging.debug(f'{module_information.service_name}: No guest session available for preview')
+            return None
+
+        # --- Attempt 1: v1 API with PREVIEW assetpresentation ---
+        try:
+            preview_data = self.session.get_track_preview_url(track_id, session_override=guest)
+            result = self._extract_preview_from_manifest(preview_data, track_id)
+            if result:
+                return result
+        except Exception as e:
+            logging.debug(f'{module_information.service_name}: v1 preview failed for track {track_id}: {e}')
+
+        # --- Attempt 2: v2 OpenAPI (same as the Tidal web player) ---
+        try:
+            preview_data = self.session.get_track_preview_v2(track_id, session_override=guest)
+            result = self._extract_preview_from_manifest(preview_data, track_id)
+            if result:
+                return result
+        except Exception as e:
+            logging.debug(f'{module_information.service_name}: v2 preview failed for track {track_id}: {e}')
+
+        return None
+
+    def _extract_preview_from_manifest(self, preview_data, track_id):
+        """Extract a playable preview from manifest data (shared by v1 and v2 paths).
+        For DASH manifests, downloads and concatenates segments into a temp .m4a file.
+        For BTS/JSON manifests, returns the direct URL.
+        Returns a file path or URL, or None."""
+        if not preview_data:
+            return None
+
+        manifest_mime = preview_data.get('manifestMimeType', '')
+        manifest_b64 = preview_data.get('manifest', '')
+        if not manifest_b64:
+            return None
+
+        try:
+            if 'application/dash+xml' in manifest_mime:
+                # DASH manifest — download segments and concatenate
+                manifest_bytes = base64.b64decode(manifest_b64)
+                audio_tracks = self.parse_mpd(manifest_bytes)
+                if not audio_tracks or not audio_tracks[0].urls:
+                    return None
+                urls = audio_tracks[0].urls
+                # Download init + all media segments and concatenate into one .m4a
+                segment_paths = []
+                try:
+                    for url in urls:
+                        seg_path = download_to_temp(url, extension='mp4')
+                        segment_paths.append(seg_path)
+                    preview_path = os.path.join(tempfile.gettempdir(), f'orpheus_tidal_preview_{track_id}.m4a')
+                    with open(preview_path, 'wb') as out:
+                        for p in segment_paths:
+                            with open(p, 'rb') as f:
+                                out.write(f.read())
+                finally:
+                    for p in segment_paths:
+                        silentremove(p)
+                if preview_path and os.path.exists(preview_path) and os.path.getsize(preview_path) > 0:
+                    return preview_path
+                silentremove(preview_path)
+                return None
+
+            elif 'application/vnd.tidal.bts' in manifest_mime:
+                # BTS (direct URL) manifest
+                manifest_json = json.loads(base64.b64decode(manifest_b64).decode('utf-8'))
+                urls = manifest_json.get('urls', [])
+                if urls:
+                    return urls[0]
+
+            else:
+                # Unknown manifest type — try JSON parsing as fallback
+                manifest_json = json.loads(base64.b64decode(manifest_b64).decode('utf-8'))
+                urls = manifest_json.get('urls', [])
+                if urls:
+                    return urls[0]
+
+        except Exception as e:
+            logging.debug(f'{module_information.service_name}: Error extracting preview manifest for track {track_id}: {e}')
+
+        return None
+
+    def _format_additional_info(self, item):
+        """Format additional info (traits) for display in the GUI."""
+        additional = []
+        tags = item.get('mediaMetadata', {}).get('tags', [])
+        
+        if 'DOLBY_ATMOS' in tags or 'DOLBY_ATMOS' in item.get('audioModes', []):
+            additional.append("Dolby Atmos")
+        if 'SONY_360RA' in tags or 'SONY_360RA' in item.get('audioModes', []):
+            additional.append("360 Reality Audio")
+        if 'HIRES_LOSSLESS' in tags or item.get('audioQuality') == 'HI_RES':
+            additional.append("Hi Res Lossless")
+            
+        return " | ".join(additional) if additional else None
