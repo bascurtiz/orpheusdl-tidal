@@ -703,13 +703,13 @@ class ModuleInterface:
                 tags = i.get('mediaMetadata', {}).get('tags', [])
                 
                 if 'DOLBY_ATMOS' in tags or 'DOLBY_ATMOS' in audio_modes:
-                    additional_list.append('Dolby Atmos')
+                    additional_list.append('◗◖ ATMOS')
                 if 'SONY_360RA' in tags or 'SONY_360RA' in audio_modes:
                     additional_list.append('360 Reality Audio')
                 if 'HIRES_LOSSLESS' in tags or i.get('audioQuality') == 'HI_RES':
-                    additional_list.append('Hi Res Lossless')
+                    additional_list.append('🅷 HI-RES')
                 
-                additional = " | ".join(additional_list) if additional_list else None
+                additional = ", ".join(additional_list) if additional_list else None
 
                 result_id = str(i.get('id', ''))
 
@@ -897,14 +897,14 @@ class ModuleInterface:
         quality_list = []
         if 'audioModes' in album_data:
             if 'DOLBY_ATMOS' in album_data['audioModes']:
-                quality_list.append('Dolby Atmos')
+                quality_list.append('◗◖ ATMOS')
             if 'SONY_360RA' in album_data['audioModes']:
                 quality_list.append('360 Reality Audio')
         
         if album_data.get('audioQuality') == 'HI_RES':
-            quality_list.append('Hi Res Lossless')
+            quality_list.append('🅷 HI-RES')
         
-        quality = " | ".join(quality_list) if quality_list else None
+        quality = ", ".join(quality_list) if quality_list else None
 
         release_year = None
         if album_data.get('releaseDate'):
@@ -1332,7 +1332,7 @@ class ModuleInterface:
             best_tracks = [r.result_id for r in results
                            if r.name == track_data.get('title') and
                            r.artists[0] == track_data.get('artist').get('name') and
-                           'Dolby Atmos' not in r.additional]
+                           '◗◖ ATMOS' not in r.additional]
 
             # retrieve the lyrics for the first one, otherwise return empty dict
             lyrics_data = self.session.get_lyrics(best_tracks[0]) if len(best_tracks) > 0 else {}
@@ -1525,10 +1525,10 @@ class ModuleInterface:
         tags = item.get('mediaMetadata', {}).get('tags', [])
         
         if 'DOLBY_ATMOS' in tags or 'DOLBY_ATMOS' in item.get('audioModes', []):
-            additional.append("Dolby Atmos")
+            additional.append("◗◖ ATMOS")
         if 'SONY_360RA' in tags or 'SONY_360RA' in item.get('audioModes', []):
             additional.append("360 Reality Audio")
         if 'HIRES_LOSSLESS' in tags or item.get('audioQuality') == 'HI_RES':
-            additional.append("Hi Res Lossless")
+            additional.append("🅷 HI-RES")
             
-        return " | ".join(additional) if additional else None
+        return ", ".join(additional) if additional else None
