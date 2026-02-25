@@ -709,7 +709,7 @@ class ModuleInterface:
                 if 'HIRES_LOSSLESS' in tags or i.get('audioQuality') == 'HI_RES':
                     additional_list.append('🅷 HI-RES')
                 
-                additional = ", ".join(additional_list) if additional_list else None
+                additional = " · ".join(additional_list) if additional_list else None
 
                 result_id = str(i.get('id', ''))
 
@@ -904,7 +904,7 @@ class ModuleInterface:
         if album_data.get('audioQuality') == 'HI_RES':
             quality_list.append('🅷 HI-RES')
         
-        quality = ", ".join(quality_list) if quality_list else None
+        quality = " · ".join(quality_list) if quality_list else None
 
         release_year = None
         if album_data.get('releaseDate'):
@@ -1531,4 +1531,4 @@ class ModuleInterface:
         if 'HIRES_LOSSLESS' in tags or item.get('audioQuality') == 'HI_RES':
             additional.append("🅷 HI-RES")
             
-        return ", ".join(additional) if additional else None
+        return " · ".join(additional) if additional else None
