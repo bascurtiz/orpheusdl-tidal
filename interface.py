@@ -889,8 +889,8 @@ class ModuleInterface:
                 cache.get('data')[str(item.get('id'))] = item
 
             # filter out video clips
-            # return full track dicts with additional info (traits) already set
-            tracks = [cache['data'][tid] for tid in [str(track['item']['id']) for track in tracks_data.get('items') if track.get('type') == 'track'] if tid in cache['data']]
+            # return track IDs
+            tracks = [tid for tid in [str(track['item']['id']) for track in tracks_data.get('items') if track.get('type') == 'track'] if tid in cache['data']]
         except TidalError:
             tracks = []
 
@@ -964,8 +964,8 @@ class ModuleInterface:
             cover_type=cover_type,
             animated_cover_url=self._generate_animated_artwork_url(album_data.get('videoCover')) if album_data.get(
                 'videoCover') else None,
-            artist=album_data.get('artist').get('name'),
-            artist_id=album_data.get('artist').get('id'),
+            artist=album_data.get('artist', {}).get('name') if album_data.get('artist') else (album_data.get('artists', [{}])[0].get('name') if album_data.get('artists') else 'Unknown'),
+            artist_id=album_data.get('artist', {}).get('id') if album_data.get('artist') else (album_data.get('artists', [{}])[0].get('id') if album_data.get('artists') else None),
             tracks=tracks,
             track_extra_kwargs=cache
         )
