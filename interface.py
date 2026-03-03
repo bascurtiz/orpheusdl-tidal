@@ -821,7 +821,7 @@ class ModuleInterface:
                         # Now fetch all the found total_items
                         items = []
                         for offset in range(0, total_items // 50 + 1):
-                            print(f'Fetching {offset * 50}/{total_items}', end='\r')
+                            self.print(f'Fetching artist releases (page {offset + 1}/{total_items // 50 + 1})', end='\r')
                             items += self.session.get_page(more_items_link, params={'limit': 50, 'offset': offset * 50})[
                                 'items']
 
