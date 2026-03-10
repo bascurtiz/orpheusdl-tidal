@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import concurrent.futures
 
 # Lazy import ffmpeg to avoid circular import issues in PyInstaller bundles
 _ffmpeg_module = None
@@ -709,7 +710,7 @@ class ModuleInterface:
                 if 'HIRES_LOSSLESS' in tags or i.get('audioQuality') == 'HI_RES':
                     additional_list.append('🅷 HI-RES')
                 
-                additional = " · ".join(additional_list) if additional_list else None
+                additional = "  ".join(additional_list) if additional_list else None
 
                 result_id = str(i.get('id', ''))
 
@@ -832,20 +833,79 @@ class ModuleInterface:
                 self.session.default = previous_default
 
         # use set to filter out duplicate album ids
-        albums = {str(album.get('id')) for album in artist_albums + artist_singles + credit_albums}
-        # Include credit_albums in album_extra_kwargs so GUI has full album data (title, artist, cover) for all albums
-        all_album_dicts = {}
+        albums = {str(album.get('id')) for album in artist_albums + artist_singles + credit_albums if album}
+        
+        # Build detailed album list for GUI
+        albums_out = []
+        all_album_dicts_cache = {}
         for a in artist_albums + artist_singles + credit_albums:
             if a and a.get('id') is not None:
                 aid = str(a.get('id'))
-                # Add formatted traits to the album dict so it shows in GUI expanded list
-                a['additional'] = self._format_additional_info(a)
-                all_album_dicts[aid] = a
+                if aid not in all_album_dicts_cache:
+                    # Add formatted traits to the album dict so it shows in GUI expanded list
+                    a['additional'] = self._format_additional_info(a)
+                    all_album_dicts_cache[aid] = a
+                    
+                    release_year = None
+                    if a.get('releaseDate'):
+                        release_year = a.get('releaseDate')[:4]
+                    elif a.get('streamStartDate'):
+                        release_year = a.get('streamStartDate')[:4]
+                        
+                    albums_out.append({
+                        'id': aid,
+                        'name': a.get('title'),
+                        'artist': a.get('artist', {}).get('name') if a.get('artist') else (a.get('artists', [{}])[0].get('name') if a.get('artists') else None),
+                        'release_year': release_year,
+                        'cover_url': self._generate_artwork_url(a.get('cover'), size=56) if a.get('cover') else None,
+                        'additional': a.get('additional'),
+                        'explicit': a.get('explicit')
+                    })
+
+        # Batch fetch missing metadata (track counts/quality) for albums using ThreadPoolExecutor
+        # Especially needed for credited albums which might be barebones
+        missing_metadata = [idx for idx, t in enumerate(albums_out) if isinstance(t, dict) and (not t.get('duration') or not t.get('release_year') or not t.get('additional') or t.get('explicit') is not True)]
+        if missing_metadata:
+            a_meta = {}
+            def _fetch_tidal_album_meta(aid):
+                try:
+                    a_data = self.session.get_album(aid)
+                    if a_data:
+                        formatted = self._format_additional_info(a_data)
+                        return aid, {
+                            'additional': formatted,
+                            'year': (a_data.get('releaseDate') or a_data.get('streamStartDate') or '')[:4] or None,
+                            'explicit': a_data.get('explicit'),
+                            'raw': a_data
+                        }
+                except: pass
+                return aid, None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                fetch_ids = [albums_out[idx]['id'] for idx in missing_metadata]
+                for aid, meta in executor.map(_fetch_tidal_album_meta, fetch_ids):
+                    if meta:
+                        a_meta[str(aid)] = meta
+            
+            for idx in missing_metadata:
+                alb = albums_out[idx]
+                aid = str(alb['id'])
+                if aid in a_meta:
+                    alb['additional'] = a_meta[aid]['additional']
+                    if not alb.get('release_year'):
+                        alb['release_year'] = a_meta[aid]['year']
+                    if a_meta[aid].get('explicit'):
+                        alb['explicit'] = True
+                    elif alb.get('explicit') is None:
+                        alb['explicit'] = a_meta[aid]['explicit']
+                    # Update cache with full data for later use (e.g. get_album_info)
+                    all_album_dicts_cache[aid] = a_meta[aid]['raw']
+                    all_album_dicts_cache[aid]['additional'] = a_meta[aid]['additional']
 
         return ArtistInfo(
             name=artist_data.get('name'),
-            albums=list(albums),
-            album_extra_kwargs={'data': all_album_dicts}
+            albums=albums_out if albums_out else list(albums),
+            album_extra_kwargs={'data': all_album_dicts_cache}
         )
 
     def _is_guest_only(self):
@@ -904,7 +964,7 @@ class ModuleInterface:
         if album_data.get('audioQuality') == 'HI_RES':
             quality_list.append('🅷 HI-RES')
         
-        quality = " · ".join(quality_list) if quality_list else None
+        quality = "  ".join(quality_list) if quality_list else None
 
         release_year = None
         if album_data.get('releaseDate'):
@@ -1522,6 +1582,12 @@ class ModuleInterface:
     def _format_additional_info(self, item):
         """Format additional info (traits) for display in the GUI."""
         additional = []
+
+        # Track count for albums
+        track_count = item.get('numberOfTracks') or item.get('number_of_tracks')
+        if track_count:
+            additional.append(f"1 track" if track_count == 1 else f"{track_count} tracks")
+
         tags = item.get('mediaMetadata', {}).get('tags', [])
         
         if 'DOLBY_ATMOS' in tags or 'DOLBY_ATMOS' in item.get('audioModes', []):
@@ -1531,4 +1597,4 @@ class ModuleInterface:
         if 'HIRES_LOSSLESS' in tags or item.get('audioQuality') == 'HI_RES':
             additional.append("🅷 HI-RES")
             
-        return " · ".join(additional) if additional else None
+        return "  ".join(additional) if additional else None
