@@ -295,6 +295,10 @@ class ModuleInterface:
             return False
         return True
 
+    def is_authenticated(self) -> bool:
+        """Return True if we have at least one real (non-guest) session."""
+        return any(s != SessionType.GUEST.name for s in self.session.sessions)
+
     def _ensure_credentials(self):
         # Check if we are in guest mode (only GUEST session exists)
         if SessionType.GUEST.name in self.session.sessions and len(self.session.sessions) == 1:
@@ -310,7 +314,14 @@ class ModuleInterface:
                 login_session_type = None
                 is_gui_mode = os.environ.get('ORPHEUS_GUI') == '1'
                 if is_gui_mode:
-                    # GUI mode: auto-select TV (browser) since we can't do interactive input
+                    # GUI mode: if we are in guest mode, don't force a browser opening here.
+                    # This allows the GUI to fetch metadata/previews during searches without prompting.
+                    # Real downloads will either work (for previews) or fail later at get_stream_url.
+                    if SessionType.GUEST.name in self.session.sessions:
+                        logging.debug(f'{module_information.service_name}: GUI guest mode, skipping auto-login prompt')
+                        return
+                    
+                    # Otherwise, auto-select TV (browser) for first-time login
                     self.print(f'{module_information.service_name}: GUI mode detected, automatically using TV (browser) login.')
                     login_session_type = SessionType.TV.name
                 else:
