@@ -316,7 +316,11 @@ class ModuleInterface:
 
             self.print(f'{module_information.service_name}: Credentials missing. Please login to download tracks.', drop_level=1)
             # Prompt for login
-                    
+            saved_sessions = {}
+            while True:
+                login_session_type = None
+                is_gui_mode = os.environ.get('ORPHEUS_GUI') == '1'
+                if is_gui_mode:
                     # Otherwise, auto-select TV (browser) for first-time login
                     self.print(f'{module_information.service_name}: GUI mode detected, automatically using TV (browser) login.')
                     login_session_type = SessionType.TV.name
