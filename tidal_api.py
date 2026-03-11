@@ -69,8 +69,20 @@ class TidalApi(object):
     def _get(self, url, params=None, refresh=False, session_override=None):
         if params is None:
             params = {}
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        session = session_override or self.sessions[self.default.name]
+        # Try to get the requested session, fallback to GUEST if missing, or use the first available session
+        session_name = self.default.name
+        if session_override:
+            session = session_override
+        elif session_name in self.sessions:
+            session = self.sessions[session_name]
+        elif SessionType.GUEST.name in self.sessions:
+            session = self.sessions[SessionType.GUEST.name]
+        elif self.sessions:
+            # Absolute fallback to whatever session is available
+            session = next(iter(self.sessions.values()))
+        else:
+            raise TidalError("No sessions available in TidalApi")
+
         params['countryCode'] = session.country_code
         # if 'limit' not in params:
         #     params['limit'] = '9999'
@@ -138,7 +150,17 @@ class TidalApi(object):
         """Fetch a 30-second preview using Tidal's v2 OpenAPI (same as the web player).
         Uses openapi.tidal.com/v2/trackManifests — works with client_credentials tokens.
         Returns a dict with 'manifestMimeType' and 'manifest' keys, or None."""
-        session = session_override or self.sessions.get(SessionType.GUEST.name) or self.sessions[self.default.name]
+        # Safe session lookup
+        session = session_override
+        if not session:
+            session = self.sessions.get(SessionType.GUEST.name)
+        if not session:
+            session = self.sessions.get(self.default.name)
+        if not session and self.sessions:
+            session = next(iter(self.sessions.values()))
+        
+        if not session:
+            return None
         try:
             # Ensure token is fresh
             if hasattr(session, 'expires') and session.expires and datetime.now() > session.expires:

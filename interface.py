@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import concurrent.futures
+import threading
 
 # Lazy import ffmpeg to avoid circular import issues in PyInstaller bundles
 _ffmpeg_module = None
@@ -123,6 +124,7 @@ class ModuleInterface:
         self.print = module_controller.printer_controller.oprint
         self.disable_subscription_check = module_controller.orpheus_options.disable_subscription_check
         self.settings = module_controller.module_settings
+        self._auth_lock = threading.Lock()
 
         # LOW = 96kbit/s AAC, HIGH = 320kbit/s AAC, LOSSLESS = 44.1/16 FLAC, HI_RES <= 48/24 FLAC with MQA
         self.quality_parse = {
@@ -299,77 +301,102 @@ class ModuleInterface:
         """Return True if we have at least one real (non-guest) session."""
         return any(s != SessionType.GUEST.name for s in self.session.sessions)
 
+    def _is_guest_only(self) -> bool:
+        """Return True if only a Guest session exists."""
+        return SessionType.GUEST.name in self.session.sessions and len(self.session.sessions) == 1
+
+    def ensure_can_download(self) -> bool:
+        """
+        Called by music_downloader.py before starting a collection download.
+        Ensures we have a real session if required by the quality setting.
+        """
+        quality_tier = self.module_controller.orpheus_options.quality_tier
+        # Force login if quality is better than LOW
+        force_login = quality_tier not in {QualityEnum.MINIMUM, QualityEnum.LOW}
+        if force_login:
+            self._ensure_credentials(force=True)
+        return True
+
     def _ensure_credentials(self, force=False):
-        # Check if we are in guest mode (only GUEST session exists)
-        if SessionType.GUEST.name in self.session.sessions and len(self.session.sessions) == 1:
+        # Use lock to prevent concurrent triggers of the browser/login flow
+        with self._auth_lock:
+            # Re-check guest status inside the lock
+            if not self._is_guest_only():
+                return
+
             # Temporarily reset default to GUEST so API calls still work during login
             # (get_track_info may have set default to TV before calling us)
             previous_default = self.session.default
             self.session.default = SessionType.GUEST
 
-            # In GUI mode, we usually skip the prompt to allow "quiet" browsing in guest mode.
-            # However, if 'force' is True (e.g. during a real download), we proceed to prompt.
-            is_gui_mode = os.environ.get('ORPHEUS_GUI') == '1'
-            if is_gui_mode and not force:
-                logging.debug(f'{module_information.service_name}: GUI guest mode, skipping auto-login prompt')
-                return
-
-            self.print(f'{module_information.service_name}: Credentials missing. Please login to download tracks.', drop_level=1)
-            # Prompt for login
-            saved_sessions = {}
-            while True:
-                login_session_type = None
+            try:
+                # In GUI mode, we usually skip the prompt to allow "quiet" browsing in guest mode.
+                # However, if 'force' is True (e.g. during a real download), we proceed to prompt.
                 is_gui_mode = os.environ.get('ORPHEUS_GUI') == '1'
-                if is_gui_mode:
-                    # Otherwise, auto-select TV (browser) for first-time login
-                    self.print(f'{module_information.service_name}: GUI mode detected, automatically using TV (browser) login.')
-                    login_session_type = SessionType.TV.name
-                else:
-                    # CLI mode: always show the login method prompt
-                    self.print(f'{module_information.service_name}: Choose a login method:')
-                    self.print(f'{module_information.service_name}: 1. TV (browser)')
-                    self.print(
-                        f"{module_information.service_name}: 2. Mobile (username and password, choose TV if this doesn't work)")
+                if is_gui_mode and not force:
+                    logging.debug(f'{module_information.service_name}: GUI guest mode, skipping auto-login prompt')
+                    return
 
-                    while not login_session_type:
-                        input_str = input(' Login method: ')
-                        try:
-                            login_session_type = {
-                                '1': SessionType.TV.name,
-                                'tv': SessionType.TV.name,
-                                '2': SessionType.MOBILE_DEFAULT.name,
-                                'mobile': SessionType.MOBILE_DEFAULT.name,
-                            }[input_str.lower()]
-                        except KeyError:
-                            self.print(f'{module_information.service_name}: Invalid choice, try again')
+                self.print(f'{module_information.service_name}: Credentials missing. Please login to download tracks.', drop_level=1)
+                # Prompt for login
+                saved_sessions = {}
+                while True:
+                    login_session_type = None
+                    is_gui_mode = os.environ.get('ORPHEUS_GUI') == '1'
+                    if is_gui_mode:
+                        # Otherwise, auto-select TV (browser) for first-time login
+                        self.print(f'{module_information.service_name}: GUI mode detected, automatically using TV (browser) login.')
+                        login_session_type = SessionType.TV.name
+                    else:
+                        # CLI mode: always show the login method prompt
+                        self.print(f'{module_information.service_name}: Choose a login method:')
+                        self.print(f'{module_information.service_name}: 1. TV (browser)')
+                        self.print(
+                            f"{module_information.service_name}: 2. Mobile (username and password, choose TV if this doesn't work)")
 
-                # Re-initialize all sessions after login
-                login_session = self.auth_session(self.init_session(login_session_type), login_session_type, None)
-                saved_sessions[login_session_type] = login_session.get_storage()
-                
-                # Also auth other mobile sessions if mobile was chosen
-                for session_type in self.available_sessions:
-                    if session_type not in saved_sessions:
-                        session = self.init_session(session_type)
-                        session.refresh_token = login_session.refresh_token
-                        session.user_id = login_session.user_id
-                        session.country_code = login_session.country_code
-                        session.refresh()
-                        saved_sessions[session_type] = session.get_storage()
-                
-                # Save to temporary settings
-                self.module_controller.temporary_settings_controller.set('sessions', saved_sessions)
-                
-                # Re-initialize the API with new sessions
-                new_sessions = {}
-                for st in self.available_sessions:
-                    s = self.init_session(st)
-                    s.set_storage(saved_sessions[st])
-                    new_sessions[st] = s
-                
-                self.session.sessions = new_sessions
-                self.session.default = SessionType.TV # reset default to TV after successful login
-                break
+                        while not login_session_type:
+                            input_str = input(' Login method: ')
+                            try:
+                                login_session_type = {
+                                    '1': SessionType.TV.name,
+                                    'tv': SessionType.TV.name,
+                                    '2': SessionType.MOBILE_DEFAULT.name,
+                                    'mobile': SessionType.MOBILE_DEFAULT.name,
+                                }[input_str.lower()]
+                            except KeyError:
+                                self.print(f'{module_information.service_name}: Invalid choice, try again')
+
+                    # Re-initialize all sessions after login
+                    login_session = self.auth_session(self.init_session(login_session_type), login_session_type, None)
+                    saved_sessions[login_session_type] = login_session.get_storage()
+                    
+                    # Also auth other mobile sessions if mobile was chosen
+                    for session_type in self.available_sessions:
+                        if session_type not in saved_sessions:
+                            session = self.init_session(session_type)
+                            session.refresh_token = login_session.refresh_token
+                            session.user_id = login_session.user_id
+                            session.country_code = login_session.country_code
+                            session.refresh()
+                            saved_sessions[session_type] = session.get_storage()
+                    
+                    # Save to temporary settings
+                    self.module_controller.temporary_settings_controller.set('sessions', saved_sessions)
+                    
+                    # Re-initialize the API with new sessions
+                    new_sessions = {}
+                    for st in self.available_sessions:
+                        s = self.init_session(st)
+                        s.set_storage(saved_sessions[st])
+                        new_sessions[st] = s
+                    
+                    self.session.sessions = new_sessions
+                    self.session.default = SessionType.TV # reset default to TV after successful login
+                    break
+            finally:
+                # Restore previous default if we are still in guest mode (e.g. if is_gui_mode and not force)
+                if self._is_guest_only():
+                    self.session.default = previous_default
 
     @staticmethod
     def _generate_artwork_url(cover_id: str, size: int, max_size: int = 1280):
@@ -721,7 +748,7 @@ class ModuleInterface:
                 if 'HIRES_LOSSLESS' in tags or i.get('audioQuality') == 'HI_RES':
                     additional_list.append('🅷 HI-RES')
                 
-                additional = "  ".join(additional_list) if additional_list else None
+                additional = " / ".join(additional_list) if additional_list else None
 
                 result_id = str(i.get('id', ''))
 
@@ -975,7 +1002,7 @@ class ModuleInterface:
         if album_data.get('audioQuality') == 'HI_RES':
             quality_list.append('🅷 HI-RES')
         
-        quality = "  ".join(quality_list) if quality_list else None
+        quality = " / ".join(quality_list) if quality_list else None
 
         release_year = None
         if album_data.get('releaseDate'):
@@ -1626,4 +1653,4 @@ class ModuleInterface:
         if 'HIRES_LOSSLESS' in tags or item.get('audioQuality') == 'HI_RES':
             additional.append("🅷 HI-RES")
             
-        return "  ".join(additional) if additional else None
+        return " / ".join(additional) if additional else None
