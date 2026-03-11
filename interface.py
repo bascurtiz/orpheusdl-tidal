@@ -299,7 +299,7 @@ class ModuleInterface:
         """Return True if we have at least one real (non-guest) session."""
         return any(s != SessionType.GUEST.name for s in self.session.sessions)
 
-    def _ensure_credentials(self):
+    def _ensure_credentials(self, force=False):
         # Check if we are in guest mode (only GUEST session exists)
         if SessionType.GUEST.name in self.session.sessions and len(self.session.sessions) == 1:
             # Temporarily reset default to GUEST so API calls still work during login
@@ -307,19 +307,15 @@ class ModuleInterface:
             previous_default = self.session.default
             self.session.default = SessionType.GUEST
 
+            # In GUI mode, we usually skip the prompt to allow "quiet" browsing in guest mode.
+            # However, if 'force' is True (e.g. during a real download), we proceed to prompt.
+            is_gui_mode = os.environ.get('ORPHEUS_GUI') == '1'
+            if is_gui_mode and not force:
+                logging.debug(f'{module_information.service_name}: GUI guest mode, skipping auto-login prompt')
+                return
+
             self.print(f'{module_information.service_name}: Credentials missing. Please login to download tracks.', drop_level=1)
             # Prompt for login
-            saved_sessions = {}
-            while True:
-                login_session_type = None
-                is_gui_mode = os.environ.get('ORPHEUS_GUI') == '1'
-                if is_gui_mode:
-                    # GUI mode: if we are in guest mode, don't force a browser opening here.
-                    # This allows the GUI to fetch metadata/previews during searches without prompting.
-                    # Real downloads will either work (for previews) or fail later at get_stream_url.
-                    if SessionType.GUEST.name in self.session.sessions:
-                        logging.debug(f'{module_information.service_name}: GUI guest mode, skipping auto-login prompt')
-                        return
                     
                     # Otherwise, auto-select TV (browser) for first-time login
                     self.print(f'{module_information.service_name}: GUI mode detected, automatically using TV (browser) login.')
@@ -1103,18 +1099,36 @@ class ModuleInterface:
         # define all default values in case the stream_data is None (region locked)
         audio_track, mqa_file, track_codec, bitrate, download_args, error = None, None, CodecEnum.FLAC, None, None, None
 
-        # Ensure we have credentials before fetching stream URL
-        self._ensure_credentials()
+        # Ensure we have credentials before fetching stream URL.
+        # Force login if quality is better than LOW (which guest mode usually doesn't support well for full tracks)
+        # or if we are already in HIFI/ATMOS mode.
+        force_login = quality_tier not in {QualityEnum.MINIMUM, QualityEnum.LOW}
+        self._ensure_credentials(force=force_login)
 
         try:
             stream_data = self.session.get_stream_url(track_id, self.quality_parse[
                 quality_tier] if format != 'flac_hires' else 'HI_RES_LOSSLESS')
-        except TidalRequestError as e:
-            error = e
-            # definitely region locked
-            if 'Asset is not ready for playback' in str(e):
-                error = f'Track [{track_id}] is not available in your region'
-            stream_data = None
+        except (TidalRequestError, TidalError) as e:
+            # If guest session failed with 401/403, it's likely that even LOW quality requires a real session now,
+            # or the guest session is blocked/expired. Force a login prompt.
+            is_auth_error = False
+            if isinstance(e, TidalRequestError):
+                is_auth_error = e.payload.get('status') in (401, 403)
+            elif isinstance(e, TidalError):
+                is_auth_error = '401' in str(e) or '403' in str(e)
+
+            if is_auth_error and self._is_guest_only():
+                self.print(f'{module_information.service_name}: Guest session insufficient. Triggering login...', drop_level=1)
+                self._ensure_credentials(force=True)
+                # Retry once after login
+                stream_data = self.session.get_stream_url(track_id, self.quality_parse[
+                    quality_tier] if format != 'flac_hires' else 'HI_RES_LOSSLESS')
+            else:
+                error = e
+                # definitely region locked
+                if 'Asset is not ready for playback' in str(e):
+                    error = f'Track [{track_id}] is not available in your region'
+                stream_data = None
 
         if stream_data is not None:
             if stream_data['manifestMimeType'] == 'application/dash+xml':
