@@ -897,7 +897,8 @@ class ModuleInterface:
                         'release_year': release_year,
                         'cover_url': self._generate_artwork_url(a.get('cover'), size=56) if a.get('cover') else None,
                         'additional': a.get('additional'),
-                        'explicit': a.get('explicit')
+                        'explicit': a.get('explicit'),
+                        'duration': a.get('duration')
                     })
 
         # Batch fetch missing metadata (track counts/quality) for albums using ThreadPoolExecutor
@@ -914,6 +915,7 @@ class ModuleInterface:
                             'additional': formatted,
                             'year': (a_data.get('releaseDate') or a_data.get('streamStartDate') or '')[:4] or None,
                             'explicit': a_data.get('explicit'),
+                            'duration': a_data.get('duration'),
                             'raw': a_data
                         }
                 except: pass
@@ -936,6 +938,10 @@ class ModuleInterface:
                         alb['explicit'] = True
                     elif alb.get('explicit') is None:
                         alb['explicit'] = a_meta[aid]['explicit']
+                    
+                    if a_meta[aid].get('duration'):
+                        alb['duration'] = a_meta[aid]['duration']
+
                     # Update cache with full data for later use (e.g. get_album_info)
                     all_album_dicts_cache[aid] = a_meta[aid]['raw']
                     all_album_dicts_cache[aid]['additional'] = a_meta[aid]['additional']
@@ -1441,14 +1447,14 @@ class ModuleInterface:
             # search for title and artist to find a matching track (non Atmos)
             results = self.search(
                 DownloadTypeEnum.track,
-                f'{track_data.get("title")} {" ".join(a.get("name") for a in track_data.get("artists"))}',
+                f'{track_data.get("title")} {" ".join(a.get("name") for a in (track_data.get("artists") or []))}',
                 limit=10)
 
             # check every result to find a matching result
             best_tracks = [r.result_id for r in results
                            if r.name == track_data.get('title') and
                            r.artists[0] == track_data.get('artist').get('name') and
-                           '◗◖ ATMOS' not in r.additional]
+                           '◗◖ ATMOS' not in (r.additional or '')]
 
             # retrieve the lyrics for the first one, otherwise return empty dict
             lyrics_data = self.session.get_lyrics(best_tracks[0]) if len(best_tracks) > 0 else {}
