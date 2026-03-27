@@ -631,7 +631,7 @@ class TidalTvSession(TidalSession):
         else:
             device_code = r.json()['deviceCode']
             user_code = r.json()['userCode']
-            print('Opening https://link.tidal.com/{}, log in or sign up to TIDAL.'.format(user_code))
+            print('Opening https://link.tidal.com/{} , log in or sign up to TIDAL.'.format(user_code))
             webbrowser.open('https://link.tidal.com/' + user_code, new=2)
 
         data = {
