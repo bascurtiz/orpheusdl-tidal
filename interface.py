@@ -138,7 +138,6 @@ class ModuleInterface:
         }
 
         # save all the TidalSession objects
-        sessions = {}
         self.available_sessions = [SessionType.TV.name, SessionType.MOBILE_DEFAULT.name, SessionType.MOBILE_ATMOS.name]
 
         # load all saved sessions (TV, Mobile Atmos, Mobile Default)
@@ -151,8 +150,10 @@ class ModuleInterface:
 
         # Check if we should use guest mode (if no sessions exist)
         use_guest = not saved_sessions
+        is_gui_mode = os.environ.get('ORPHEUS_GUI') == '1'
 
         while True:
+            sessions = {}
             login_session = None
 
             def auth_and_save_session(session, session_type):
@@ -174,6 +175,11 @@ class ModuleInterface:
 
             # ask for login if there are no saved sessions
             if not saved_sessions:
+                if is_gui_mode:
+                    logging.debug(f"{module_information.service_name}: No saved sessions in GUI mode, falling back to guest")
+                    use_guest = True
+                    continue
+
                 login_session_type = None
                 if len(self.available_sessions) == 1:
                     login_session_type = self.available_sessions[0]
@@ -218,8 +224,20 @@ class ModuleInterface:
                     module_controller.temporary_settings_controller.set('sessions', saved_sessions)
 
                 # check for a valid subscription
-                subscription = self.check_subscription(sessions[session_type].get_subscription())
+                try:
+                    subscription_info = sessions[session_type].get_subscription()
+                    subscription = self.check_subscription(subscription_info)
+                except Exception as e:
+                    logging.debug(f"{module_information.service_name}: Failed to check subscription: {e}")
+                    subscription = False
+
                 if not subscription:
+                    if is_gui_mode:
+                        logging.debug(f"{module_information.service_name}: Subscription invalid or check failed in GUI mode – falling back to guest")
+                        use_guest = True
+                        saved_sessions = {} # Clear so we go to guest mode
+                        break
+
                     confirm = input(' Do you want to relogin? [Y/n]: ')
 
                     if confirm.upper() == 'N':
