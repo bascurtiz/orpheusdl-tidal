@@ -69,7 +69,7 @@ from utils.exceptions import InvalidInput
 from utils.models import *
 import os
 import tempfile
-from utils.utils import sanitise_name, silentremove, download_to_temp, create_temp_filename, create_requests_session
+from utils.utils import sanitise_name, silentremove, download_to_temp, create_temp_filename, create_requests_session, get_primary_artist
 from .mqa_identifier_python.mqa_identifier_python.mqa_identifier import MqaIdentifier
 from .tidal_api import TidalTvSession, TidalApi, TidalMobileSession, TidalGuestSession, SessionType, TidalError, TidalRequestError
 
@@ -1057,12 +1057,20 @@ class ModuleInterface:
                 ))
             tracks = track_objects
 
+        # Extract label from credits (using first track) or fallback to copyright
+        album_label = None
+        if tracks_data and tracks_data.get('items'):
+            album_label = self._extract_label_from_credits(tracks_data['items'][0].get('credits'))
+        if not album_label:
+            album_label = self._extract_label_from_copyright(album_data.get('copyright'))
+
         return AlbumInfo(
             name=album_data.get('title'),
             release_year=release_year,
             explicit=album_data.get('explicit'),
             quality=quality,
             upc=album_data.get('upc'),
+            label=album_label,
             duration=album_data.get('duration'),
             cover_url=cover_url,
             cover_type=cover_type,
@@ -1098,6 +1106,15 @@ class ModuleInterface:
 
             # add the region locked album to the cache in order to properly use it later (force_album_format)
             self.album_cache = {album_id: album_data}
+
+        # Fetch credits if missing (needed for label extract)
+        if 'credits' not in track_data:
+            try:
+                # get_track_contributors returns {items: [...]}
+                contributors_resp = self.session.get_track_contributors(track_id)
+                track_data['credits'] = (contributors_resp or {}).get('items') or []
+            except:
+                track_data['credits'] = []
 
         media_tags = track_data['mediaMetadata']['tags']
         format = None
@@ -1474,28 +1491,86 @@ class ModuleInterface:
 
         credits_dict = {}
 
+        # Normalize roles to standard tagging keys
+        role_mapping = {
+            'Lyricist': 'Lyricist',
+            'Lyricists': 'Lyricist',
+            'Vocals': 'Lyricist',
+            'Composer': 'Composer',
+            'Composers': 'Composer',
+            'Producer': 'Producer',
+            'Producers': 'Producer',
+            'Music Publisher': 'Music Publisher'
+        }
+
         # fetch credits from cache if not fetch those credits
         if track_id in data:
-            track_contributors = data[track_id]
+            track_contributors = data[track_id] or []
 
             for contributor in track_contributors:
-                credits_dict[contributor.get('type')] = [c.get('name') for c in contributor.get('contributors')]
+                # Get the contributors list, fallback to empty list if None
+                sub_contributors = contributor.get('contributors') or []
+                role = contributor.get('type')
+                normalized_role = role_mapping.get(role, role)
+                
+                if normalized_role not in credits_dict:
+                    credits_dict[normalized_role] = []
+                credits_dict[normalized_role].extend([c.get('name') for c in sub_contributors])
         else:
-            track_contributors = self.session.get_track_contributors(track_id).get('items')
+            contributors_resp = self.session.get_track_contributors(track_id)
+            track_contributors = (contributors_resp or {}).get('items') or []
 
-            if len(track_contributors) > 0:
+            if track_contributors:
                 for contributor in track_contributors:
                     # check if the dict contains no list, create one
-                    if contributor.get('role') not in credits_dict:
-                        credits_dict[contributor.get('role')] = []
+                    role = contributor.get('role')
+                    if role:
+                        normalized_role = role_mapping.get(role, role)
+                        if normalized_role not in credits_dict:
+                            credits_dict[normalized_role] = []
 
-                    credits_dict[contributor.get('role')].append(contributor.get('name'))
+                        credits_dict[normalized_role].append(contributor.get('name'))
 
         if len(credits_dict) > 0:
             # convert the dictionary back to a list of CreditsInfo
             return [CreditsInfo(sanitise_name(k), v) for k, v in credits_dict.items()]
         return None
 
+
+    @staticmethod
+    def _extract_label_from_credits(credits_list: list) -> Optional[str]:
+        if not credits_list:
+            return None
+
+        labels = []
+        for credit in credits_list:
+            # Check for various forms of label/publisher in credits
+            # Raw API uses 'role' or 'type' depending on endpoint
+            credit_type = credit.get('type') or credit.get('role')
+            if credit_type in {'Record Label', 'Label', 'Production'}:
+                # Contributors can be a list or we use the name field directly if it's a flattened credit
+                contributors = credit.get('contributors')
+                if contributors:
+                    for c in contributors:
+                        if c.get('name') and c.get('name') not in labels:
+                            labels.append(c.get('name'))
+                elif credit.get('name'):
+                    if credit.get('name') not in labels:
+                        labels.append(credit.get('name'))
+
+        return '; '.join(labels) if labels else None
+
+    @staticmethod
+    def _extract_label_from_copyright(copyright_str: str) -> Optional[str]:
+        if not copyright_str:
+            return None
+
+        # Remove (C), (P), ©, ℗ and leading years
+        # Example: "© 2022 Taylor Swift" -> "Taylor Swift"
+        import re
+        # Strip leading symbols and years
+        res = re.sub(r'^[©℗(C)(P)\s\d-]{2,}', '', copyright_str).strip()
+        return res if res else None
 
     @staticmethod
     def convert_tags(track_data: dict, album_data: dict, mqa_file: MqaIdentifier = None) -> Tags:
@@ -1511,8 +1586,17 @@ class ModuleInterface:
                 'ORIGINALSAMPLERATE': str(mqa_file.original_sample_rate)
             }
 
+        album_artist = get_primary_artist(album_data.get('artist', {}).get('name')) if 'artist' in album_data else None
+
+        # Extract label from credits or fallback to copyright
+        credits_list = track_data.get('credits')
+        label = ModuleInterface._extract_label_from_credits(credits_list)
+        if not label:
+            # Fallback to copyright string (cleaned up)
+            label = ModuleInterface._extract_label_from_copyright(track_data.get('copyright'))
+
         return Tags(
-            album_artist=album_data.get('artist').get('name') if 'artist' in album_data else None,
+            album_artist=album_artist,
             track_number=track_data.get('trackNumber'),
             total_tracks=album_data.get('numberOfTracks'),
             disc_number=track_data.get('volumeNumber'),
@@ -1521,8 +1605,10 @@ class ModuleInterface:
             upc=album_data.get('upc'),
             release_date=album_data.get('releaseDate'),
             copyright=track_data.get('copyright'),
+            label=label,
             replay_gain=track_data.get('replayGain'),
             replay_peak=track_data.get('peak'),
+            track_url=f"https://listen.tidal.com/track/{track_data.get('id')}",
             extra_tags=extra_tags
         )
 
