@@ -275,6 +275,39 @@ class TidalApi(object):
     def get_album_tracks(self, album_id):
         return self._get('albums/' + str(album_id) + '/tracks')
 
+    def get_album_items(self, album_id, offset: int = 0, limit: int = 100):
+        return self._get('albums/' + str(album_id) + '/items', params={
+            'offset': offset,
+            'limit': limit,
+        })
+
+    def _paginate_album_items(self, album_id, path_suffix: str, extra_params=None):
+        """Paginate albums/{id}/items or albums/{id}/tracks."""
+        params = {'offset': 0, 'limit': 100}
+        if extra_params:
+            params.update(extra_params)
+        result = self._get(f'albums/{album_id}/{path_suffix}', params)
+        if result.get('totalNumberOfItems', 0) <= 100:
+            return result
+        offset = len(result.get('items') or [])
+        while offset < result.get('totalNumberOfItems', 0):
+            page_params = {'offset': offset, 'limit': 100}
+            if extra_params:
+                page_params.update(extra_params)
+            buf = self._get(f'albums/{album_id}/{path_suffix}', page_params)
+            page_items = buf.get('items') or []
+            if not page_items:
+                break
+            result['items'] = (result.get('items') or []) + page_items
+            offset += len(page_items)
+        return result
+
+    def get_album_items_all(self, album_id):
+        return self._paginate_album_items(album_id, 'items')
+
+    def get_album_tracks_all(self, album_id):
+        return self._paginate_album_items(album_id, 'tracks')
+
     def get_track(self, track_id):
         return self._get('tracks/' + str(track_id))
 

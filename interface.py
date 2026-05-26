@@ -975,6 +975,171 @@ class ModuleInterface:
         return (SessionType.GUEST.name in self.session.sessions and
                 len(self.session.sessions) == 1)
 
+    @staticmethod
+    def _track_display_title(item: dict) -> str:
+        title = (item or {}).get('title') or 'Unknown'
+        version = (item or {}).get('version')
+        if version:
+            title = f'{title} ({version})'
+        return title
+
+    @staticmethod
+    def _track_artists_from_item(item: dict) -> list:
+        return [a.get('name') for a in (item or {}).get('artists', []) if a.get('name')]
+
+    def _merge_tidal_album_exclusions(
+        self,
+        album_id: str,
+        included_track_ids: list,
+        cache: dict,
+        excluded_tracks: list,
+        expected_track_count: int = None,
+    ) -> list:
+        """Find album tracks/items missing from the download list and return enriched exclusions."""
+        included_ids = set()
+        for tid in included_track_ids:
+            if hasattr(tid, 'id'):
+                included_ids.add(str(tid.id))
+            else:
+                included_ids.add(str(tid))
+        seen_ids = {str(e.get('id')) for e in excluded_tracks if e.get('id')}
+
+        def append_exclusion(item: dict, entry_type: str, reason: str):
+            item_id = str(item.get('id')) if item.get('id') is not None else None
+            if item_id and item_id in seen_ids:
+                return
+            if item_id:
+                seen_ids.add(item_id)
+            excluded_tracks.append({
+                'id': item_id,
+                'name': self._track_display_title(item),
+                'artists': self._track_artists_from_item(item),
+                'track_number': item.get('trackNumber'),
+                'disc_number': item.get('volumeNumber'),
+                'reason': reason,
+            })
+
+        for source_name, fetch in (
+            ('album items', lambda: self.session.get_album_items_all(album_id)),
+            ('album tracks', lambda: self.session.get_album_tracks_all(album_id)),
+        ):
+            try:
+                payload = fetch()
+            except TidalError:
+                continue
+            for entry in payload.get('items') or []:
+                if isinstance(entry, dict) and entry.get('item') is not None:
+                    entry_type = entry.get('type') or 'track'
+                    item = entry.get('item') or {}
+                else:
+                    entry_type = 'track'
+                    item = entry if isinstance(entry, dict) else {}
+                item_id = str(item.get('id')) if item.get('id') is not None else None
+                if not item_id or item_id in included_ids:
+                    continue
+                if entry_type != 'track':
+                    append_exclusion(
+                        item,
+                        entry_type,
+                        f'Not downloaded: {entry_type} item on album ({source_name})',
+                    )
+                else:
+                    append_exclusion(
+                        item,
+                        entry_type,
+                        f'Not downloaded: listed on album via {source_name} but omitted from credits API',
+                    )
+
+        excluded_tracks.extend(
+            self._detect_tidal_per_disc_track_gaps(cache, seen_ids)
+        )
+
+        return excluded_tracks
+
+    def _detect_tidal_per_disc_track_gaps(self, cache: dict, seen_ids: set) -> list:
+        """
+        Detect missing tracks from gaps in per-disc trackNumber sequences (multi-disc albums
+        repeat track 1..N on each disc). Optionally probe sequential track IDs between neighbors.
+        """
+        from collections import defaultdict
+
+        by_disc = defaultdict(list)
+        for tid, td in (cache.get('data') or {}).items():
+            track_no = td.get('trackNumber')
+            if track_no is None:
+                continue
+            disc = int(td.get('volumeNumber') or 1)
+            by_disc[disc].append((int(track_no), str(tid), td))
+
+        exclusions = []
+        logged_positions = set()
+
+        for disc in sorted(by_disc):
+            entries = sorted(by_disc[disc], key=lambda row: row[0])
+            if len(entries) < 2:
+                continue
+            nums = [row[0] for row in entries]
+            by_num = {num: (tid, td) for num, tid, td in entries}
+            for gap_num in range(min(nums), max(nums) + 1):
+                if gap_num in by_num:
+                    continue
+                pos_key = (disc, gap_num)
+                if pos_key in logged_positions:
+                    continue
+                logged_positions.add(pos_key)
+
+                prev_entry = by_num.get(gap_num - 1)
+                next_entry = by_num.get(gap_num + 1)
+                guessed_id = None
+                title = f'(disc {disc} track {gap_num})'
+                artists = []
+                reason = (
+                    f'Missing from album track list (disc {disc} track {gap_num} — '
+                    f'not returned by TIDAL items/credits API)'
+                )
+
+                if prev_entry and next_entry:
+                    try:
+                        prev_id = int(prev_entry[0])
+                        next_id = int(next_entry[0])
+                        if next_id - prev_id == 2:
+                            guessed_id = str(prev_id + 1)
+                            try:
+                                track_payload = self.session.get_track(guessed_id)
+                                title = self._track_display_title(track_payload)
+                                artists = self._track_artists_from_item(track_payload)
+                                reason = (
+                                    'Region-locked or unavailable for your account '
+                                    f'(catalog id {guessed_id} — present on TIDAL but not streamable here)'
+                                )
+                            except TidalError as exc:
+                                msg = str(exc)
+                                if 'region' in msg.lower() or 'not found' in msg.lower():
+                                    reason = (
+                                        f'Region-locked or unavailable for your account '
+                                        f'(catalog id {guessed_id})'
+                                    )
+                                else:
+                                    reason = f'Unavailable (catalog id {guessed_id}: {msg})'
+                    except (TypeError, ValueError):
+                        pass
+
+                if guessed_id and guessed_id in seen_ids:
+                    continue
+                if guessed_id:
+                    seen_ids.add(guessed_id)
+
+                exclusions.append({
+                    'id': guessed_id,
+                    'name': title,
+                    'artists': artists,
+                    'track_number': gap_num,
+                    'disc_number': disc,
+                    'reason': reason,
+                })
+
+        return exclusions
+
     def get_album_info(self, album_id: str, data=None) -> AlbumInfo:
         # check if album is already in album cache, add it
         if data is None:
@@ -990,6 +1155,7 @@ class ModuleInterface:
         # get all album tracks with corresponding credits with a limit of 100
         limit = 100
         cache = {'data': {}}
+        excluded_tracks = []
         try:
             tracks_data = self.session.get_album_contributors(album_id, limit=limit)
             total_tracks = tracks_data.get('totalNumberOfItems')
@@ -1010,11 +1176,34 @@ class ModuleInterface:
                 item['additional'] = self._format_additional_info(item)
                 cache.get('data')[str(item.get('id'))] = item
 
-            # filter out video clips
-            # return track IDs
-            tracks = [tid for tid in [str(track['item']['id']) for track in tracks_data.get('items') if track.get('type') == 'track'] if tid in cache['data']]
+            # filter out video clips and other non-audio items; record exclusions for error.txt
+            excluded_tracks = []
+            tracks = []
+            for entry in tracks_data.get('items') or []:
+                entry_type = entry.get('type')
+                item = entry.get('item') or {}
+                item_id = str(item.get('id')) if item.get('id') is not None else None
+                title = item.get('title') or 'Unknown'
+                if entry_type != 'track':
+                    excluded_tracks.append({
+                        'id': item_id,
+                        'name': title,
+                        'artists': [a.get('name') for a in item.get('artists', []) if a.get('name')],
+                        'reason': f'Excluded: not an audio track (type={entry_type or "unknown"})',
+                    })
+                    continue
+                if not item_id or item_id not in cache.get('data', {}):
+                    excluded_tracks.append({
+                        'id': item_id,
+                        'name': title,
+                        'artists': [a.get('name') for a in item.get('artists', []) if a.get('name')],
+                        'reason': 'Excluded: track metadata unavailable from TIDAL API',
+                    })
+                    continue
+                tracks.append(item_id)
         except TidalError:
             tracks = []
+            excluded_tracks = []
 
         quality_list = []
         if 'audioModes' in album_data:
@@ -1082,6 +1271,21 @@ class ModuleInterface:
         if not album_label:
             album_label = self._extract_label_from_copyright(album_data.get('copyright'))
 
+        expected_track_count = album_data.get('numberOfTracks')
+        if expected_track_count is not None:
+            try:
+                expected_track_count = int(expected_track_count)
+            except (TypeError, ValueError):
+                expected_track_count = None
+
+        excluded_tracks = self._merge_tidal_album_exclusions(
+            album_id,
+            tracks,
+            cache,
+            excluded_tracks,
+            expected_track_count=expected_track_count,
+        )
+
         return AlbumInfo(
             name=album_data.get('title'),
             release_year=release_year,
@@ -1097,6 +1301,8 @@ class ModuleInterface:
             artist=album_data.get('artist', {}).get('name') if album_data.get('artist') else (album_data.get('artists', [{}])[0].get('name') if album_data.get('artists') else 'Unknown'),
             artist_id=album_data.get('artist', {}).get('id') if album_data.get('artist') else (album_data.get('artists', [{}])[0].get('id') if album_data.get('artists') else None),
             tracks=tracks,
+            expected_track_count=expected_track_count,
+            excluded_tracks=excluded_tracks or None,
             track_extra_kwargs=cache
         )
 
