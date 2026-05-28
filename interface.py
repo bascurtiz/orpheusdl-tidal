@@ -452,14 +452,56 @@ class ModuleInterface:
             media_id=match.group('media_id'),
         )
 
+    def _merge_user_playlist_search_hits(self, query: str, catalog_items: list, limit: int) -> list:
+        """Prepend user-created playlists whose titles match query (catalog search omits these)."""
+        if not query or not query.strip() or not self.is_authenticated():
+            return catalog_items
+        auth = self.session.authenticated_session()
+        if not auth or not auth.user_id:
+            return catalog_items
+        q_lower = query.strip().lower()
+        user_hits = []
+        try:
+            for entry in self.session.iter_user_playlist_entries(auth.user_id):
+                if entry.get('type') != 'USER_CREATED':
+                    continue
+                pl = entry.get('playlist')
+                if not isinstance(pl, dict):
+                    continue
+                title = (pl.get('title') or '').strip()
+                if not title or q_lower not in title.lower():
+                    continue
+                user_hits.append(pl)
+        except Exception as e:
+            logging.debug('%s: user playlist search skipped: %s', module_information.service_name, e)
+            return catalog_items
+        if not user_hits:
+            return catalog_items
+        seen = set()
+        merged = []
+        for i in user_hits + (catalog_items or []):
+            uid = i.get('uuid')
+            if uid:
+                if uid in seen:
+                    continue
+                seen.add(uid)
+            merged.append(i)
+            if len(merged) >= limit:
+                break
+        return merged
+
     def search(self, query_type: DownloadTypeEnum, query: str, track_info: TrackInfo = None, limit: int = 20):
         if track_info and track_info.tags.isrc:
             results = self.session.get_tracks_by_isrc(track_info.tags.isrc)
+            result_items = results.get('items') if isinstance(results, dict) else None
         else:
             results = self.session.get_search_data(query, limit=limit)[query_type.name + 's']
+            result_items = results.get('items')
+            if query_type is DownloadTypeEnum.playlist:
+                result_items = self._merge_user_playlist_search_hits(query, result_items, limit)
 
         items = []
-        for i in results.get('items'):
+        for i in result_items or []:
             duration, name = None, None
             image_url = None
             preview_url = None
@@ -493,10 +535,13 @@ class ModuleInterface:
                 # Note: If artist image is not in search results, it may need to be fetched
                 # separately via get_artist() API call. The lazy-loading in GUI will handle this.
             elif query_type is DownloadTypeEnum.playlist:
-                if 'name' in i.get('creator'):
-                    artists = [i.get('creator').get('name')]
+                creator = i.get('creator') or {}
+                if creator.get('name'):
+                    artists = [creator.get('name')]
                 elif i.get('type') == 'EDITORIAL':
                     artists = [module_information.service_name]
+                elif i.get('type') == 'USER':
+                    artists = ['You']
                 else:
                     artists = ['Unknown']
 

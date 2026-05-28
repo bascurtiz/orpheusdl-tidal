@@ -219,6 +219,46 @@ class TidalApi(object):
             'includeContributors': 'true'
         })
 
+    def authenticated_session(self):
+        """First logged-in session (guest sessions have no user_id), or None."""
+        preferred = (
+            SessionType.TV.name,
+            SessionType.MOBILE_ATMOS.name,
+            SessionType.MOBILE_DEFAULT.name,
+        )
+        for name in preferred:
+            session = self.sessions.get(name)
+            if session and getattr(session, 'user_id', None):
+                return session
+        for session in self.sessions.values():
+            if getattr(session, 'user_id', None):
+                return session
+        return None
+
+    def get_user_playlists_and_favorites(self, user_id, offset=0, limit=100):
+        auth = self.authenticated_session()
+        if not auth:
+            raise TidalAuthError('User login required to list personal playlists')
+        return self._get(
+            f'users/{user_id}/playlistsAndFavoritePlaylists',
+            params={'offset': offset, 'limit': limit},
+            session_override=auth,
+        )
+
+    def iter_user_playlist_entries(self, user_id):
+        """Yield USER_CREATED / favorite playlist wrapper objects from the user's library."""
+        offset = 0
+        page_size = 100
+        while True:
+            page = self.get_user_playlists_and_favorites(user_id, offset=offset, limit=page_size)
+            items = page.get('items') or []
+            for item in items:
+                yield item
+            offset += len(items)
+            total = page.get('totalNumberOfItems', 0)
+            if not items or offset >= total:
+                break
+
     def get_page(self, pageurl, params=None):
         local_params = {
             'deviceType': 'TV',
