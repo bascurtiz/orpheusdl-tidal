@@ -235,7 +235,7 @@ class TidalApi(object):
                 return session
         return None
 
-    def get_user_playlists_and_favorites(self, user_id, offset=0, limit=100):
+    def get_user_playlists_and_favorites(self, user_id, offset=0, limit=50):
         auth = self.authenticated_session()
         if not auth:
             raise TidalAuthError('User login required to list personal playlists')
@@ -248,7 +248,7 @@ class TidalApi(object):
     def iter_user_playlist_entries(self, user_id):
         """Yield USER_CREATED / favorite playlist wrapper objects from the user's library."""
         offset = 0
-        page_size = 100
+        page_size = 50  # API returns 400 if limit > 50 ("Too big page, max page size is [50]")
         while True:
             page = self.get_user_playlists_and_favorites(user_id, offset=offset, limit=page_size)
             items = page.get('items') or []

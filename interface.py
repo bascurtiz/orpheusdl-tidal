@@ -473,7 +473,7 @@ class ModuleInterface:
                     continue
                 user_hits.append(pl)
         except Exception as e:
-            logging.debug('%s: user playlist search skipped: %s', module_information.service_name, e)
+            logging.warning('%s: user playlist search failed: %s', module_information.service_name, e)
             return catalog_items
         if not user_hits:
             return catalog_items
