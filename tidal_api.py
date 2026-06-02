@@ -393,11 +393,37 @@ class TidalApi(object):
     def get_artist(self, artist_id):
         return self._get('artists/' + str(artist_id))
 
+    def _get_all_artist_albums(self, artist_id, params=None):
+        # Tidal defaults to 20 items per page when no limit is supplied, which previously
+        # capped an artist's album list. Paginate via limit/offset to return every album.
+        base_params = dict(params or {})
+        page_size = 50
+        url = 'artists/' + str(artist_id) + '/albums'
+
+        first = self._get(url, params={**base_params, 'limit': page_size, 'offset': 0})
+        items = list(first.get('items') or [])
+        total = first.get('totalNumberOfItems')
+        if total is None:
+            total = len(items)
+
+        offset = page_size
+        while len(items) < total:
+            page = self._get(url, params={**base_params, 'limit': page_size, 'offset': offset})
+            page_items = page.get('items') or []
+            if not page_items:
+                break
+            items += page_items
+            offset += page_size
+
+        result = dict(first)
+        result['items'] = items
+        return result
+
     def get_artist_albums(self, artist_id):
-        return self._get('artists/' + str(artist_id) + '/albums')
+        return self._get_all_artist_albums(artist_id)
 
     def get_artist_albums_ep_singles(self, artist_id):
-        return self._get('artists/' + str(artist_id) + '/albums', params={'filter': 'EPSANDSINGLES'})
+        return self._get_all_artist_albums(artist_id, params={'filter': 'EPSANDSINGLES'})
 
     def get_type_from_id(self, id_):
         result = None
