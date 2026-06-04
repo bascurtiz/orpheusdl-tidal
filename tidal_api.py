@@ -4,13 +4,14 @@ import json
 import secrets
 import sys
 import time
-import webbrowser
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, auto
 
 import requests
 import urllib3
+
+from utils.utils import open_url_in_browser
 
 import urllib.parse as urlparse
 from urllib.parse import parse_qs, quote
@@ -730,8 +731,9 @@ class TidalTvSession(TidalSession):
         else:
             device_code = r.json()['deviceCode']
             user_code = r.json()['userCode']
-            print('Opening https://link.tidal.com/{}, log in or sign up to TIDAL.'.format(user_code))
-            webbrowser.open('https://link.tidal.com/' + user_code, new=2)
+            link_url = 'https://link.tidal.com/' + user_code
+            print('Opening {}, log in or sign up to TIDAL.'.format(link_url))
+            open_url_in_browser(link_url)
 
         data = {
             'client_id': self.client_id,
