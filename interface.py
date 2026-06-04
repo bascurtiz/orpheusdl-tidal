@@ -810,7 +810,12 @@ class ModuleInterface:
                     additional_list.append('360 Reality Audio')
                 if 'HIRES_LOSSLESS' in tags or i.get('audioQuality') == 'HI_RES':
                     additional_list.append('🅷 HI-RES')
-                
+                elif (
+                    i.get('audioQuality') in ('LOSSLESS', 'LOSSLESS_STEREO')
+                    or 'LOSSLESS' in tags
+                ) and not additional_list:
+                    additional_list.append('FLAC')
+
                 additional = " / ".join(additional_list) if additional_list else None
 
                 result_id = str(i.get('id', ''))
@@ -1251,15 +1256,21 @@ class ModuleInterface:
             excluded_tracks = []
 
         quality_list = []
+        album_tags = album_data.get('mediaMetadata', {}).get('tags', [])
         if 'audioModes' in album_data:
             if 'DOLBY_ATMOS' in album_data['audioModes']:
                 quality_list.append('◗◖ ATMOS')
             if 'SONY_360RA' in album_data['audioModes']:
                 quality_list.append('360 Reality Audio')
-        
-        if album_data.get('audioQuality') == 'HI_RES':
+
+        if 'HIRES_LOSSLESS' in album_tags or album_data.get('audioQuality') == 'HI_RES':
             quality_list.append('🅷 HI-RES')
-        
+        elif (
+            album_data.get('audioQuality') in ('LOSSLESS', 'LOSSLESS_STEREO')
+            or 'LOSSLESS' in album_tags
+        ) and not quality_list:
+            quality_list.append('FLAC')
+
         quality = " / ".join(quality_list) if quality_list else None
 
         release_year = None
@@ -2030,5 +2041,10 @@ class ModuleInterface:
             additional.append("360 Reality Audio")
         if 'HIRES_LOSSLESS' in tags or item.get('audioQuality') == 'HI_RES':
             additional.append("🅷 HI-RES")
-            
+        elif (
+            item.get('audioQuality') in ('LOSSLESS', 'LOSSLESS_STEREO')
+            or 'LOSSLESS' in tags
+        ) and not any('HI-RES' in str(x) or '🅷' in str(x) for x in additional):
+            additional.append('FLAC')
+
         return " / ".join(additional) if additional else None
