@@ -857,8 +857,8 @@ class ModuleInterface:
             cover_url = 'https://tidal.com/browse/assets/images/defaultImages/defaultPlaylistImage.png'
             cover_type = ImageFileTypeEnum.png
 
-        # In guest-only mode, return TrackInfo objects so the GUI won't call get_track_info
-        if self._is_guest_only() and track_data_dict:
+        # Playlist items already include title/duration; build TrackInfo so expand skips per-track API calls.
+        if track_data_dict:
             track_objects = []
             for tid in tracks:
                 td = track_data_dict.get(tid, {})
