@@ -1754,6 +1754,22 @@ class ModuleInterface:
             synced=re.sub(r'(\[\d{2}:\d{2}.\d{2,3}])(?: )', r'\1', synced) if synced else None
         )
 
+    @staticmethod
+    def _normalize_track_contributors_cache(cached) -> Optional[list]:
+        """Return contributor list from data[track_id], or None to fetch from the API."""
+        if cached is None:
+            return None
+        if isinstance(cached, list):
+            return cached
+        if isinstance(cached, dict):
+            if 'credits' in cached:
+                credits = cached.get('credits')
+                return credits if isinstance(credits, list) else None
+            # Full track payloads (e.g. search raw_result) are not contributor caches.
+            if any(k in cached for k in ('title', 'album', 'artists', 'duration')):
+                return None
+        return None
+
     def get_track_credits(self, track_id: str, data=None) -> Optional[list]:
         if data is None:
             data = {}
@@ -1772,10 +1788,11 @@ class ModuleInterface:
             'Music Publisher': 'Music Publisher'
         }
 
-        # fetch credits from cache if not fetch those credits
+        track_contributors = None
         if track_id in data:
-            track_contributors = data[track_id] or []
+            track_contributors = self._normalize_track_contributors_cache(data[track_id])
 
+        if track_contributors is not None:
             for contributor in track_contributors:
                 # Get the contributors list, fallback to empty list if None
                 sub_contributors = contributor.get('contributors') or []
