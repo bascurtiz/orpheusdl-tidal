@@ -1407,7 +1407,10 @@ class ModuleInterface:
                     format = 'ac4'
                 else:
                     format = 'ac3'
-        if 'HIRES_LOSSLESS' in media_tags and not format and quality_tier is QualityEnum.HIFI:
+        # Both HIFI and ATMOS tiers want true Hi-Res FLAC for tracks that have no spatial mix.
+        # Without ATMOS here, a non-Atmos track under the Atmos tier falls through to the TV
+        # session and silently downgrades a Hi-Res album to CD-quality LOSSLESS.
+        if 'HIRES_LOSSLESS' in media_tags and not format and quality_tier in (QualityEnum.HIFI, QualityEnum.ATMOS):
             format = 'flac_hires'
 
         session = {
